@@ -1,0 +1,41 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+
+# ===== Environments / editors =====
+.venv/
+venv/
+.env
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+.claude/
+
+# ===== Weights, data and outputs: never committed =====
+# models/ holds the downloaded VIBE and taesana weights, runs/ the trained students,
+# data/ teacher data, out/ engines, videos and logs. The training commands are in README.md.
+models/
+data/
+out/
+runs/
+
+# ===== Clips (download separately, see assets/README.md) =====
+assets/*
+!assets/README.md
+
+# ===== TensorRT / ONNX artefacts (host-specific) =====
+*.engine
+*.plan
+*.onnx
+*.onnx.data
+
+# ===== Misc =====
+*.log
+*.tmp
+notes/

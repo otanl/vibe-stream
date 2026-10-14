@@ -1,0 +1,14 @@
+# Tested versions (Windows, Python 3.10, CUDA 12.4). Install torch for your CUDA from pytorch.org first.
+torch==2.6.0
+transformers==4.57.3      # Qwen3-VL needs >= 4.57
+diffusers==0.37.1
+accelerate
+safetensors
+huggingface_hub
+numpy
+pillow
+opencv-python-headless
+lpips                     # training and evaluation
+# TensorRT engine (optional; the PyTorch path runs without these)
+tensorrt==10.16.1.11
+onnx
