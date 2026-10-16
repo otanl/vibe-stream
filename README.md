@@ -9,8 +9,9 @@ whose DreamLite-mobile weights are CC BY-NC 4.0. Everything this repository runs
 or MIT (see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)), and VIBE's still-image quality is not below
 DreamLite-mobile's: styles are about equal and instruction edits are clearly better.
 
-**Status: research code.** One student is trained (2 steps, two style prompts, 768 px); the whole streaming loop
-runs at 21.0 fps at 768 on an RTX 3090 Ti. The numbers below say what has been measured and how.
+**Status: research code.** Two students are trained (2 steps, two style prompts, at 768 and at 640 px); the whole
+streaming loop runs at 21.0 fps at 768 and 29.1 fps at 640 on an RTX 3090 Ti. The numbers below say what has been
+measured and how.
 
 ## How it works
 
@@ -62,25 +63,34 @@ stronger edit).
 - With taesana for encode and decode instead of DC-AE, the lam-4 one-step student's output is LPIPS 0.134 from the
   DC-AE path and its warping error is unchanged (15.4 vs 15.9). taesana is crisp and slightly grainy.
 
-### Speed (768, batch 8)
+**At 640 px** (`lam4_2step_640`: same recipe on 640 px teacher data, scored against VIBE's own 640 px 8-step output):
 
-| Stage | ms per frame |
-|---|---:|
-| Transformer, TensorRT fp16 engine (bf16 PyTorch eager: 36) | 20.5 per step |
-| taesana encode + decode, PyTorch fp16 | 0.9 + 8.7 |
-| DC-AE encode + decode, TensorRT fp16 (not used) | 39 + 58 |
-| **Whole loop: 2-step student + taesana, uint8 frames in and out** | **47.7 (21.0 fps)** |
+| Configuration (640) | Warp | LPIPS to teacher | Sobel | Edge | CLIP dir oil / anime |
+|---|---:|---:|---:|---:|---:|
+| VIBE, 8 steps (teacher) | 29.4 | — | 12.2 | 0.29 | 0.245 / 0.218 |
+| 2-step student, lam 4 (`lam4_2step_640`) | 19.4 | 0.234 | 8.8 | 0.30 | 0.240 / 0.204 |
 
-The last row is `scripts/stream_video.py` on DAVIS `blackswan` (50 frames cycled to 480, prompt `oil`): loop
-21.0 fps and step-only 21.0 fps, i.e. the host side (pinned copies, uint8 conversion) is fully hidden behind the GPU.
-The instruction embedding is computed once per clip. Output warping error 18.3 with taesana and the engine.
-Without TensorRT (`--student`, PyTorch bf16 with the LoRA merged) the same loop runs at 12.6 fps, warping error
-18.4.
+The student keeps the same distance to its teacher as at 768. VIBE itself repaints less at 640 on some clips (on
+`parkour` its anime output keeps a plain sky where the 768 output paints clouds), which the student inherits.
+
+### Speed (batch 8)
+
+| Stage, ms per frame | 768 | 640 |
+|---|---:|---:|
+| Transformer, TensorRT fp16 engine, per step (bf16 PyTorch eager at 768: 36) | 20.5 | 15.2 |
+| taesana encode + decode, PyTorch fp16 | 0.9 + 8.7 | |
+| DC-AE encode + decode at 768, TensorRT fp16 (not used) | 39 + 58 | |
+| **Whole loop: 2-step student + taesana, uint8 frames in and out** | **47.7 (21.0 fps)** | **34.4 (29.1 fps)** |
+
+The last row is `scripts/stream_video.py` on DAVIS `blackswan` (50 frames cycled to 480, prompt `oil`): loop and
+step-only fps are equal at both sizes (21.0 / 21.0 at 768, 29.1 / 29.1 at 640), i.e. the host side (pinned copies,
+uint8 conversion) is fully hidden behind the GPU. The instruction embedding is computed once per clip. Output
+warping error with taesana and the engine: 18.3 at 768, 18.1 at 640. Without TensorRT (`--student`, PyTorch bf16
+with the LoRA merged) the 768 loop runs at 12.6 fps, warping error 18.4.
 
 Step-only and loop fps are defined as in dreamlite-stream (`src/vibe_stream/stream.py`). For comparison,
-dreamlite-stream's lean path with its one-step LoRA and TensorRT UNet runs at 25 fps loop at 768. The remaining
-cost is the transformer (2 x 20.5 ms); a one-step student would run at about 30 ms per frame but loses edit
-strength (table above).
+dreamlite-stream's lean path with its one-step LoRA and TensorRT UNet runs at 25 fps loop at 768. The remaining cost is the transformer (2 steps); a one-step student would run at about 30 ms per
+frame at 768 but loses edit strength (table above), and DMD does not win it back (Negative results).
 
 ## Setup
 
@@ -113,6 +123,11 @@ python scripts/make_teacher_data.py --out data/teacher_768                   # 4
 python scripts/train_student.py --data data/teacher_768 --run runs/lam4_2step \
     --student_steps 2 --lam 4 --grad_ckpt                                    # 1500 steps, ~56 min, 8 GB
 python scripts/eval_student.py --out out/eval --runs runs/lam4_2step --base
+# ... at 640: data in 6 min, training ~39 min at 1.55 s/step; build_trt.py and stream_video.py read the size
+# from the student / engine
+python scripts/make_teacher_data.py --out data/teacher_640 --size 640
+python scripts/train_student.py --data data/teacher_640 --run runs/lam4_2step_640 --student_steps 2 --lam 4 --grad_ckpt
+python scripts/eval_student.py --size 640 --out out/eval_640 --runs runs/lam4_2step_640
 ```
 
 A student is tied to its resolution, its init noise (stored in the file) and, in practice, the prompts it was
