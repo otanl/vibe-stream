@@ -117,6 +117,8 @@ python scripts/stream_video.py --input assets/davis_mp4/blackswan.mp4 --prompt o
     --engine out/trt/vibe_lam4_2step_768_b8.engine --output out/stream/blackswan_oil.mp4 --compare
 # ... or with PyTorch only
 python scripts/stream_video.py --input ... --student runs/lam4_2step/lora.safetensors
+# Demo video: input | oil | anime for every clip in assets/davis_mp4 through the same path (H.264 if ffmpeg is on PATH)
+python scripts/make_demo.py --engine out/trt/vibe_lam4_2step_640_b8.engine --out out/demo_640
 
 # Train a student
 python scripts/make_teacher_data.py --out data/teacher_768                   # 47 windows x 10 frames x 2 prompts
