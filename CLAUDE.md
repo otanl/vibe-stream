@@ -45,6 +45,18 @@ checked by running scripts and reading what they print.
   at call time, so a checkpointed backward must run with the selection of its forward: the student's backward runs
   with "student" active, the fake model's update inside `use(..., "aux")`. It did not help (README, Negative
   results).
+- Optional shift-equivariance term (`train_student.py --w_eq`): the first frame of a pair shifted by a random
+  sub-token offset (up to `--eq_shift` px), re-encoded with DC-AE and compared with the unshifted output moved by the
+  same offset. The student's flicker comes mostly from texture anchored to the screen (shared noise, 32-pixel latent
+  grid) under content that moves by less than a token; this term targets it with exact correspondences.
+- Flicker is measured by `metrics.flicker` (output change only where the input's flow explains the input, split into
+  a sigma-4 low band and the rest) on the streaming path, `scripts/eval_flicker.py`, which also runs the shift probe.
+  The warping error alone mixes flicker with occlusions and flow failures.
+- `temporal_filter.TemporalFilter` is a display-side option of `StreamEditor` (`--temporal_filter LOW HIGH`): DIS
+  flow of the input on the host while the GPU works on the previous batch, copied from pinned buffers without a
+  sync, then a two-band recursive blend on the GPU after the decoder. A synchronous host-to-device copy inside the
+  loop would stall the host on the batch in flight and serialise the double buffering. Its state is reset by
+  `set_prompt` and at the start of every `run`.
 - Edit strength is measured by CLIP directional similarity (`metrics.CLIPScore`, captions in
   `presets.CLIP_CAPTIONS`); LPIPS to the teacher alone cannot tell a weaker edit from a different one.
 - TensorRT (`trt_engine.py`): LoRA merged, `caption_projection` + `caption_norm` kept outside the engine and

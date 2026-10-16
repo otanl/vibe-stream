@@ -101,6 +101,69 @@ Step-only and loop fps are defined as in dreamlite-stream (`src/vibe_stream/stre
 dreamlite-stream's lean path with its one-step LoRA and TensorRT UNet runs at 25 fps loop at 768. The remaining cost is the transformer (2 steps); a one-step student would run at about 30 ms per
 frame at 768 but loses edit strength (table above), and DMD does not win it back (Negative results).
 
+### Flicker (640, streaming path)
+
+`scripts/eval_flicker.py`: DAVIS `blackswan`, `parkour`, `dance-twirl`, `camel`, `goat` and `libby`, first 40 frames,
+prompts `oil` and `anime`, through the streaming editor with taesana (PyTorch bf16). *Valid* is the frame-to-frame
+change of the output after warping by the input's flow, counted only where the same warp reproduces the input
+(`metrics.flicker`; the input itself scores about 2.5): what remains is change the edit added. *Low* / *high* split
+it at a Gaussian of sigma 4 px. DreamLite-mobile's lean path scores about 12 for both prompts on the same clips
+(measured on dreamlite-stream's 768 demo).
+
+**Where it comes from.** Every frame starts from the same init noise, and the transformer works on 32-pixel latent
+tokens, so the student's texture is anchored to the screen: content that moves by a few pixels gets repainted
+instead of carried along. The shift probe crops a wider frame at horizontal offsets and compares each output with
+the unshifted output moved by the same offset (0 = the output moves with the content):
+
+| Offset (px) | 0.5 | 1 | 2 | 4 | 8 | 16 | 32 | 32, noise rolled 1 token |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `lam4_2step_640` | 3.5 | 5.6 | 8.5 | 11.1 | 14.3 | 18.3 | 19.3 | 6.5 |
+| `lam8_2step_640` | 2.7 | 4.0 | 6.3 | 8.6 | 11.1 | 13.8 | 14.8 | 4.8 |
+| `lam4_eq4_2step_640` | 2.5 | 3.7 | 5.7 | 7.8 | 10.0 | 12.4 | 13.1 | 4.3 |
+
+On the released student a one-pixel shift already changes the output by 5.6; rolling the noise along with a
+whole-token shift removes two thirds of the change at 32 px, so the shared noise is most of it. But motion between
+frames is mostly a few pixels, and noise cannot follow sub-token motion (Negative results). What can be changed is
+the student (the two rows below it, described next) and the display.
+
+**Students and the display filter.** `lam8`: the temporal weight doubled. `eq4`: lam 4 plus a shift-equivariance
+term (`train_student.py --w_eq 4`): the first frame of a pair is also shifted by a random sub-token offset
+(up to 16 px), and its output must equal the unshifted output moved by the same offset, an exact correspondence
+instead of the input flow. *Filter*: `temporal_filter.TemporalFilter(0.7, 0.3)` on the decoded frames
+(`--temporal_filter 0.7 0.3`): the output is split at a Gaussian of sigma 6 px and each band is blended with the
+previous shown frame warped by the input's flow (DIS at 320 px), 0.7 of the previous frame in the low band and
+0.3 in the high band, turned off where the warp does not reproduce the input.
+
+| Student | Display | Valid oil / anime | Low / high (oil) | Warp oil | Sobel oil | CLIP dir oil / anime |
+|---|---|---:|---:|---:|---:|---:|
+| `lam4_2step_640` (released) | plain | 20.9 / 12.2 | 12.6 / 13.7 | 22.3 | 13.1 | 0.213 / 0.175 |
+| | filter 0.7 / 0.3 | 14.0 / 8.1 | 7.3 / 10.3 | 15.9 | 11.2 | 0.208 / 0.165 |
+| | filter 0.85 / 0.5 | 11.5 / 6.8 | 6.0 / 8.5 | 13.7 | 10.1 | 0.204 / 0.159 |
+| `lam8_2step_640` | plain | 16.3 / 9.8 | 9.6 / 10.9 | 17.5 | 10.5 | 0.202 / 0.174 |
+| | filter 0.7 / 0.3 | 11.0 / 6.6 | 5.6 / 8.2 | 12.6 | 8.9 | 0.198 / 0.165 |
+| `lam4_eq4_2step_640` | plain | 14.8 / 8.9 | 8.7 / 9.9 | 15.9 | 9.6 | 0.196 / 0.173 |
+| | filter 0.7 / 0.3 | 10.0 / 6.0 | 5.1 / 7.5 | 11.5 | 8.2 | 0.192 / 0.165 |
+
+Against VIBE's 640 px 8-step output (`eval_student.py --size 640`, DC-AE path, as in the 640 table above):
+
+| Student | Warp | LPIPS to teacher | Sobel | Edge | CLIP dir oil / anime |
+|---|---:|---:|---:|---:|---:|
+| `lam4_2step_640` | 19.4 | 0.234 | 8.8 | 0.30 | 0.240 / 0.204 |
+| `lam8_2step_640` | 14.9 | 0.261 | 7.0 | 0.30 | 0.233 / 0.202 |
+| `lam4_eq4_2step_640` | 13.4 | 0.274 | 6.5 | 0.29 | 0.227 / 0.201 |
+
+- Both training changes buy steadiness with texture and edit strength, and at the same rate: the line from lam 4
+  through lam 8, extended to eq4's warping error, predicts eq4's Sobel, LPIPS and CLIP oil in the teacher comparison
+  to within 0.1, 0.004 and 0.004. The equivariance term does not move the trade-off, and it doubles the training
+  time (3.0 s/step).
+- The display filter does better than either: on the released student it takes flicker from 20.9 to 14.0 (oil) and
+  keeps Sobel 11.2 and CLIP 0.208, where training to about that level (eq4, 14.8) costs Sobel 9.6 and CLIP 0.196.
+  Most of the gain is in the low band (12.6 to 7.3: the token-sized colour blotches); the light high-band blend
+  keeps the strokes. A stronger setting (0.85 / 0.5) reaches lam 8's filtered flicker on the released student with
+  more texture and oil edit strength (Sobel 10.1 against 8.9, CLIP 0.204 against 0.198), though anime loses a little
+  (0.159 against 0.165). It works on any student and stacks with them. Single frames of the 0.7 / 0.3 output look like
+  the plain ones with slightly softer strokes, with no double edges on the moving figures of these clips.
+
 ## Setup
 
 The code expects an upstream VIBE checkout next to it (or `VIBE_REPO` pointing at one) and the weights in `models/`:
@@ -126,6 +189,10 @@ python scripts/stream_video.py --input assets/davis_mp4/blackswan.mp4 --prompt o
     --engine out/trt/vibe_lam4_2step_768_b8.engine --output out/stream/blackswan_oil.mp4 --compare
 # ... or with PyTorch only
 python scripts/stream_video.py --input ... --student runs/lam4_2step/lora.safetensors
+# ... with the display-side temporal filter (any of these scripts, including make_demo.py)
+python scripts/stream_video.py --input ... --engine ... --temporal_filter 0.7 0.3
+# Flicker of a student, plain and filtered, and the shift probe; --table compares result files
+python scripts/eval_flicker.py --student runs/lam4_2step_640/lora.safetensors --out out/flicker/lam4_2step_640.json
 # Demo video: input | oil | anime for every clip in assets/davis_mp4 through the same path (H.264 if ffmpeg is on PATH)
 python scripts/make_demo.py --engine out/trt/vibe_lam4_2step_640_b8.engine --out out/demo_640
 
@@ -154,7 +221,8 @@ one TensorRT version and platform; `<engine>.json` records them and a mismatch i
   - `taesana.py`: the tiny autoencoder
   - `trt_engine.py`: ONNX export, engine build, runtime wrapper
   - `stream.py`: batched, double-buffered streaming editor
-  - `metrics.py`: video I/O, warping error, Sobel, edge agreement, LPIPS
+  - `temporal_filter.py`: display-side two-band temporal filter
+  - `metrics.py`: video I/O, warping error, flicker split, Sobel, edge agreement, LPIPS, CLIP scores
 - `scripts/`: one entry point per step above.
 
 `models/`, `data/`, `runs/` and `out/` are gitignored; weights are never committed.
@@ -184,6 +252,24 @@ one TensorRT version and platform; `<engine>.json` records them and a mismatch i
   best (Sobel 6.8) and collapsed with a weaker penalty. The released taesana is used as is.
 - **Mirror-flip augmentation for encoder distillation** is wrong for DC-AE latents (they are not mirror-symmetric),
   and crop training misses DC-AE's global context: train an encoder on whole frames.
+- **Init noise that moves with the content** (no retraining; `lam4_2step_640` engine, the six clips and metrics of
+  "Flicker" above). A noise canvas on a grid eight times finer than the latent tokens holds the student's noise at
+  offset 0, so that every offset by whole cells is again i.i.d. N(0, 1) per token; the window followed the global
+  motion of the input (median flow, accumulated). Flicker went up instead of down (valid-pixel change oil 20.8 to
+  23.1, anime 12.1 to 12.6). Sub-token offsets give every token new noise, and new noise per frame is a new picture.
+  It is not that the student only knows its own noise: another fixed draw scores like it (20.4 / 11.2).
+- **Run-time anchoring** (no retraining, same setting). Each variant cut flicker only by giving up style or texture:
+
+  | Variant | Valid change oil / anime | CLIP dir oil / anime | Sobel oil |
+  |---|---:|---:|---:|
+  | 2 steps from the shared noise (as shipped) | 20.8 / 12.1 | 0.213 / 0.175 | 13.1 |
+  | Step 2 only, from the input frame's latent re-noised to step 2's sigma | 9.4 / 6.8 | 0.157 / 0.128 | 7.1 |
+  | Step 2 only, from the previous output warped by the input flow | 12.7 / 8.8 | 0.192 / 0.166 | 8.8 |
+  | Both steps, step 1's clean estimate replaced by the warped previous output where the flow holds | 18.2 / 11.6 | 0.206 / 0.175 | 11.5 |
+  | Full-band blend of the output with the warped previous output, 50/50 | 12.3 / 7.3 | 0.203 / 0.163 | 9.7 |
+
+  The two-band display filter ("Flicker" above: 14.0 / 8.1, Sobel 11.2, CLIP 0.208 / 0.165) keeps more texture than
+  the full-band blend for slightly more flicker.
 
 ## Reference: SANA-Streaming
 

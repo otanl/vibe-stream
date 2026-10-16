@@ -17,6 +17,17 @@ cannot redraw the frame in k steps settle near the input; this term instead pena
 produce. The fake model is a second LoRA on the same frozen base (`lora.add_aux`), updated `--fake_updates` times per
 step on the step's student latents with fresh noise.
 
+--w_eq > 0 adds a shift-equivariance term: the first frame of each pair is also shifted by a random sub-token
+translation d (up to --eq_shift pixels, bilinear, reflected border), DC-AE-encoded and run through the student, and
+its decoded crop is compared with the original output sampled at x + d (masked L1, same margin as the temporal term).
+The correspondence is exact, unlike the input flow of the temporal term; it targets the student's main flicker
+mechanism, outputs that do not move with content shifted by less than one 32-pixel latent token.
+
+--w_tex > 0 adds a texture-amount term: L1 between the local amplitude of detail (above a sigma-2 blur, energy
+averaged over sigma 8 px) of the decoded crop and of the teacher crop. The teacher paints its texture at different
+places on consecutive frames, so a student pulled towards both the teacher and temporal consistency averages it
+away; this term asks for the teacher's amount of texture without asking for its placement.
+
 Recipe of the released 2-step student (runs/lam4_2step): --student_steps 2 --lam 4 --grad_ckpt, 1500 steps,
 about 8 GB and 2 s/step (56 min) on an RTX 3090 Ti. One step: drop --grad_ckpt (16.5 GB, 1.0 s/step).
 
@@ -29,6 +40,7 @@ import random
 import time
 from pathlib import Path
 
+import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -36,7 +48,7 @@ from torch.utils.checkpoint import checkpoint
 
 import _paths  # noqa: F401
 from vibe_stream import lora
-from vibe_stream.temporal_loss import masked_warp_l1, occlusion_mask
+from vibe_stream.temporal_loss import masked_warp_l1, occlusion_mask, warp
 from vibe_stream.vibe_model import VibeModel
 
 
@@ -59,6 +71,9 @@ def main():
     p.add_argument("--fake_lr", type=float, default=1e-4)
     p.add_argument("--fake_updates", type=int, default=2, help="fake score updates per student step")
     p.add_argument("--dmd_sigma", type=float, nargs=2, default=(0.02, 0.98), help="range of the re-noising sigma")
+    p.add_argument("--w_eq", type=float, default=0.0, help="weight of the shift-equivariance term (0: off)")
+    p.add_argument("--eq_shift", type=float, default=16.0, help="largest synthetic shift in pixels")
+    p.add_argument("--w_tex", type=float, default=0.0, help="weight of the texture-amount term (0: off)")
     p.add_argument("--init", default=None, help="start the student from this LoRA file (same rank and noise)")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--log_every", type=int, default=50)
@@ -100,7 +115,32 @@ def main():
         opt, lambda s: min(1.0, (s + 1) / 50) * (0.5 * (1 + math.cos(math.pi * s / a.steps))))
     lat_n, cl, S, mg = size // 32, a.crop // 32, a.crop, a.margin
     log = open(run / "log.jsonl", "w", encoding="utf-8")
-    acc = dict.fromkeys(("huber", "lpips", "temp", "temp_teacher") + (("dmd", "dmd_g", "fake") if a.w_dmd > 0 else ()), 0.0)
+    acc = dict.fromkeys(("huber", "lpips", "temp", "temp_teacher") + (("dmd", "dmd_g", "fake") if a.w_dmd > 0 else ())
+                        + (("eq",) if a.w_eq > 0 else ()) + (("tex",) if a.w_tex > 0 else ()), 0.0)
+
+    def gblur(x, sigma):
+        r = int(3 * sigma + 0.5)
+        k = torch.exp(-torch.arange(-r, r + 1, device=x.device, dtype=x.dtype) ** 2 / (2 * sigma ** 2))
+        k = (k / k.sum()).view(1, 1, 1, -1).expand(x.shape[1], 1, 1, -1)
+        x = F.conv2d(F.pad(x, (r, r, 0, 0), mode="reflect"), k, groups=x.shape[1])
+        return F.conv2d(F.pad(x, (0, 0, r, r), mode="reflect"), k.transpose(2, 3), groups=x.shape[1])
+
+    def texture_amount(x):
+        """Local amplitude of the detail above a sigma-2 blur, averaged over sigma 8 px: how much texture, not where."""
+        hp = x - gblur(x, 2.0)
+        return (gblur(hp.pow(2).mean(1, keepdim=True), 8.0) + 1e-6).sqrt()
+
+    def decode_crop(x0, cy, cx):
+        z = (x0[:, :, cy:cy + cl, cx:cx + cl] / m.sf).to(torch.bfloat16)
+        # one frame at a time, recomputed in backward: the decoder's full-resolution activations dominate memory
+        return torch.cat([checkpoint(lambda zz: m.vae.decode(zz).sample, z[i:i + 1], use_reentrant=False)
+                          for i in range(len(z))]).float()
+
+    def shifted(frame, dx, dy):
+        """frame(x + d): the frame with its content moved by -d, sub-pixel, border reflected."""
+        mat = np.float32([[1, 0, dx], [0, 1, dy]])
+        return cv2.warpAffine(frame, mat, (size, size), flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
+                              borderMode=cv2.BORDER_REFLECT_101)
 
     def renoise(x0):
         """x0 re-noised at a random sigma per sample; returns (x_t, sigma, eps, VIBE timestep)."""
@@ -151,10 +191,7 @@ def main():
         with torch.autocast("cuda", dtype=torch.bfloat16):
             x0 = m.student(img_lat, emb, a.student_steps)
             l_lat = F.smooth_l1_loss(x0, tlat, beta=0.1)
-            z = (x0[:, :, cy:cy + cl, cx:cx + cl] / m.sf).to(torch.bfloat16)
-            # one frame at a time, recomputed in backward: the decoder's full-resolution activations dominate memory
-            dec = torch.cat([checkpoint(lambda zz: m.vae.decode(zz).sample, z[i:i + 1], use_reentrant=False)
-                             for i in range(len(z))]).float()
+            dec = decode_crop(x0, cy, cx)
         inner = (slice(None), slice(None), slice(mg, S - mg), slice(mg, S - mg))
         l_lp = lp(dec[inner].clamp(-1, 1), timg[inner]).mean()
         out01 = (dec.clamp(-1, 1) + 1) / 2
@@ -165,6 +202,20 @@ def main():
             l_tt = masked_warp_l1(t01[0::2], t01[1::2], flow, mask, mg)
         loss = l_lat + a.w_lp * l_lp + a.lam * l_t
         terms = [("huber", l_lat), ("lpips", l_lp), ("temp", l_t), ("temp_teacher", l_tt)]
+        if a.w_eq > 0:
+            d = [(random.uniform(-a.eq_shift, a.eq_shift), random.uniform(-a.eq_shift, a.eq_shift)) for _ in items]
+            il_s = m.encode([shifted(dd["frames"][t], dx, dy) for (dd, _, t), (dx, dy) in zip(items, d)]).clone()
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                out_s = (decode_crop(m.student(il_s, emb[0::2], a.student_steps), cy, cx).clamp(-1, 1) + 1) / 2
+            flow_d = torch.tensor(d, device=dev, dtype=torch.float32)[:, None, None, :].expand(-1, S, S, -1)
+            inb = warp(torch.ones_like(out_s[:, :1]), flow_d)[1]
+            l_eq = masked_warp_l1(out_s, out01[0::2], flow_d, inb, mg)
+            loss = loss + a.w_eq * l_eq
+            terms.append(("eq", l_eq))
+        if a.w_tex > 0:
+            l_tex = (texture_amount(out01) - texture_amount(t01)).abs()[inner].mean()
+            loss = loss + a.w_tex * l_tex
+            terms.append(("tex", l_tex))
         if a.w_dmd > 0:
             l_dmd, g_abs = dmd_term(x0, img_lat, emb)
             loss = loss + a.w_dmd * l_dmd
@@ -182,6 +233,8 @@ def main():
             r = {k: v / a.log_every for k, v in acc.items()}
             el = time.perf_counter() - t0
             dmd = f"dmd {r['dmd']:.4f} |g| {r['dmd_g']:.3f} fake {r['fake']:.4f}  " if a.w_dmd > 0 else ""
+            dmd += f"eq {r['eq'] * 255:.2f}  " if a.w_eq > 0 else ""
+            dmd += f"tex {r['tex'] * 255:.2f}  " if a.w_tex > 0 else ""
             print(f"[train] {step + 1:5d}/{a.steps} huber {r['huber']:.4f} lpips {r['lpips']:.4f} "
                   f"temp {r['temp'] * 255:.2f} (teacher {r['temp_teacher'] * 255:.2f}, /255)  {dmd}{el / (step + 1):.2f} s/step  "
                   f"peak {torch.cuda.max_memory_allocated() / 2**30:.1f} GB", flush=True)
@@ -195,7 +248,8 @@ def main():
     lora.save(run / "lora.safetensors", state, dict(base="VIBE-Image-Edit-DistilledCFG", size=size, rank=a.rank, lam=a.lam,
                                                      student_steps=a.student_steps, w_lp=a.w_lp, steps=a.steps,
                                                      prompts=prompts, teacher_steps=meta["teacher_steps"],
-                                                     w_dmd=a.w_dmd, init=a.init))
+                                                     w_dmd=a.w_dmd, w_eq=a.w_eq, eq_shift=a.eq_shift,
+                                                     w_tex=a.w_tex, init=a.init))
     print(f"[train] saved {run / 'lora.safetensors'} after {time.perf_counter() - t0:.0f} s", flush=True)
 
 
