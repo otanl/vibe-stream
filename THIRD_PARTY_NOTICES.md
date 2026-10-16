@@ -44,7 +44,7 @@ SOFTWARE.
 | Qwen3-VL-2B (VIBE's text encoder) | [Qwen](https://huggingface.co/Qwen) | Apache-2.0 |
 | taesana weights | [madebyollin/taesd](https://github.com/madebyollin/taesd) | MIT |
 | CLIP ViT-L/14 (evaluation only, `metrics.CLIPScore`) | [openai/clip-vit-large-patch14](https://huggingface.co/openai/clip-vit-large-patch14) | MIT |
-| DAVIS-2017 clips used for training and evaluation | [davischallenge.org](https://davischallenge.org/davis2017/code.html) | see the DAVIS terms; not redistributed here |
+| DAVIS-2017 clips used for training and evaluation; five appear in the README demo video | [davischallenge.org](https://davischallenge.org/davis2017/code.html) | the organizers license their annotations under CC BY 4.0 (challenge rules page) and the site's dataset metadata says CC BY-NC 4.0; no separate licence is stated for the video frames. The clips are not redistributed here |
 
 Check the publishers' current terms before redistributing weights or derived checkpoints (such as a trained student
 LoRA or a TensorRT engine built from them).

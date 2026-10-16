@@ -13,6 +13,15 @@ DreamLite-mobile's: styles are about equal and instruction edits are clearly bet
 streaming loop runs at 21.0 fps at 768 and 29.1 fps at 640 on an RTX 3090 Ti. The numbers below say what has been
 measured and how.
 
+## Demo
+
+https://github.com/user-attachments/assets/26081288-3447-4734-902b-ddc4dcb9c8a9
+
+Input | oil painting | anime on five DAVIS-2017 clips through the real-time path at 640 px on an RTX 3090 Ti: the
+2-step student, taesana, and the transformer as a TensorRT engine (`scripts/make_demo.py`). Each output panel shows
+the loop fps of its run: 27-29 fps on these short clips, 29.1 fps on the 480-frame loop in the speed table. Input
+clips: [DAVIS-2017](https://davischallenge.org/), see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
 ## How it works
 
 VIBE alone flickers on video because it redraws structure freely on every frame: even with the noise and the
