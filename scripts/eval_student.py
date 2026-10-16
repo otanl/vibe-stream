@@ -2,8 +2,9 @@
 
 For each clip and prompt (the prompts stored in the first student file, else presets.PROMPTS): the teacher (K steps
 of VIBE's scheduler), optionally the base model run as a 1- and 2-step student, and each student. Metrics per row:
-warping error, LPIPS to the teacher, Sobel and edge agreement with the input (see vibe_stream.metrics). Writes
-<out>/eval.json and a strip of four frames per row.
+warping error, LPIPS to the teacher, Sobel, edge agreement with the input and, for prompts with captions in
+presets.CLIP_CAPTIONS, the CLIP directional similarity and output-caption similarity (see vibe_stream.metrics).
+Writes <out>/eval.json and a strip of four frames per row.
 
 Usage: python scripts/eval_student.py --out out/eval --runs runs/lam4_2step runs/lam4 --base
 """
@@ -18,8 +19,8 @@ import torch
 
 import _paths  # noqa: F401
 from vibe_stream import lora
-from vibe_stream.metrics import LPIPS, edge_agreement, read_video_frames, sobel, warping_error
-from vibe_stream.presets import EVAL_CLIPS, EVAL_CLIPS_DIR, PROMPTS
+from vibe_stream.metrics import LPIPS, CLIPScore, edge_agreement, read_video_frames, sobel, warping_error
+from vibe_stream.presets import CLIP_CAPTIONS, EVAL_CLIPS, EVAL_CLIPS_DIR, PROMPTS
 from vibe_stream.vibe_model import ROOT, VibeModel
 
 
@@ -48,6 +49,7 @@ def main():
                 emb = m.embed(prompt, fr[0])
                 cases[(c, key)] = dict(il=il, emb=emb, teacher=m.decode_u8(m.sample(il, emb, a.teacher_steps)))
     m.offload_text_encoder()
+    clip = CLIPScore()
     res = {}
 
     def score(label, outputs_of):
@@ -56,9 +58,12 @@ def main():
             fr = clips[c]
             r = dict(warp=warping_error(fr, outs), lpips_to_teacher=lp(outs, cs["teacher"]), sobel=sobel(outs),
                      edge=mean(edge_agreement(x, y) for x, y in zip(fr[::4], outs[::4])))
+            if key in CLIP_CAPTIONS:
+                r.update(clip(fr, outs, *CLIP_CAPTIONS[key]))
             res[f"{label} | {c} | {key}"] = r
+            cl = f"  clip_dir {r['clip_dir']:.3f}  clip_t {r['clip_t']:.3f}" if "clip_dir" in r else ""
             print(f"[eval] {label:<28} {c:<9} {key:<6} warp {r['warp']:6.2f}  lpips->teacher {r['lpips_to_teacher']:.3f}  "
-                  f"sobel {r['sobel']:6.2f}  edge {r['edge']:.3f}", flush=True)
+                  f"sobel {r['sobel']:6.2f}  edge {r['edge']:.3f}{cl}", flush=True)
             strip = np.concatenate([cv2.resize(o, (256, 256)) for o in outs[:8:2]], axis=1)
             cv2.imwrite(str(out / f"strip_{label.replace(' ', '_')}_{c}_{key}.jpg"), cv2.cvtColor(strip, cv2.COLOR_RGB2BGR))
 
@@ -83,11 +88,14 @@ def main():
         lora.detach(m.tr, wrappers)
     (out / "eval.json").write_text(json.dumps(res, indent=1), encoding="utf-8")
     labels = list(dict.fromkeys(k.split(" | ")[0] for k in res))
-    print("\n[eval] mean over clips and prompts")
+    print("\n[eval] mean over clips and prompts (clip_dir per prompt)")
     for lab in labels:
-        rows = [v for k, v in res.items() if k.startswith(lab + " | ")]
-        print(f"  {lab:<28} warp {mean(r['warp'] for r in rows):6.2f}  lpips->teacher {mean(r['lpips_to_teacher'] for r in rows):.3f}  "
-              f"sobel {mean(r['sobel'] for r in rows):6.2f}  edge {mean(r['edge'] for r in rows):.3f}")
+        rows = {k: v for k, v in res.items() if k.startswith(lab + " | ")}
+        vals = list(rows.values())
+        per_prompt = "  ".join(f"{key} {mean(v['clip_dir'] for k, v in rows.items() if k.endswith(' | ' + key)):.3f}"
+                               for key in prompts if key in CLIP_CAPTIONS)
+        print(f"  {lab:<28} warp {mean(r['warp'] for r in vals):6.2f}  lpips->teacher {mean(r['lpips_to_teacher'] for r in vals):.3f}  "
+              f"sobel {mean(r['sobel'] for r in vals):6.2f}  edge {mean(r['edge'] for r in vals):.3f}  clip_dir {per_prompt}")
 
 
 if __name__ == "__main__":

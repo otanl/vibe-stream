@@ -40,6 +40,13 @@ checked by running scripts and reading what they print.
   file stores `init_noise`, `student_steps`, `size` and `prompts`; it is tied to all of them.
 - Temporal term (`temporal_loss.py`): flow on the INPUT frames t -> t+1, warp output t+1 back, photometric
   occlusion mask; the same convention as `metrics.warping_error`.
+- Optional DMD term (`train_student.py --w_dmd`): the teacher is the base weights and the fake score model a second
+  LoRA on the same frozen base (`lora.add_aux`; `lora.use` selects "student", "aux" or None). The selection is read
+  at call time, so a checkpointed backward must run with the selection of its forward: the student's backward runs
+  with "student" active, the fake model's update inside `use(..., "aux")`. It did not help (README, Negative
+  results).
+- Edit strength is measured by CLIP directional similarity (`metrics.CLIPScore`, captions in
+  `presets.CLIP_CAPTIONS`); LPIPS to the teacher alone cannot tell a weaker edit from a different one.
 - TensorRT (`trt_engine.py`): LoRA merged, `caption_projection` + `caption_norm` kept outside the engine and
   computed once per clip in fp32 (`VibeModel.project_embedding`), the rest fp16 strongly typed. The engine is fixed
   to one size, batch, TensorRT version and platform; `<engine>.json` records them, `<engine>.noise.safetensors`

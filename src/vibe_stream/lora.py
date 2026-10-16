@@ -7,6 +7,11 @@ frame and distillation is paired regression (`scripts/train_student.py`).
 At run time the deltas are merged into the weights (`merge`), so the merged transformer costs what the base one costs
 and an ONNX export sees an ordinary model.
 
+DMD training needs two more models next to the student: the teacher (the base weights) and a "fake score" model that
+tracks the student's outputs. Both share the frozen base here: `add_aux` gives every wrapper a second, independent
+delta and `use` selects which delta runs ("student", "aux", or None for the base alone). The selection is read at
+call time, so under gradient checkpointing a backward pass must run with the same selection as its forward.
+
 File format: safetensors with `<module path>.lora_A` (rank, in) and `<module path>.lora_B` (out, rank) per adapted
 layer, `init_noise` (1, 32, h, w), and string metadata (JSON-encoded values) describing how it was trained, among
 them `student_steps`, `size` and `prompts`. alpha equals rank, so the delta is B @ A.
@@ -16,7 +21,8 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Dict, List, Tuple
+from contextlib import contextmanager
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -30,8 +36,18 @@ TARGET_PATTERN = re.compile(
     r"transformer_blocks\.\d+\.(attn[12]\.(to_q|to_k|to_v|to_out\.0)|ff\.(conv_inverted|conv_point))$")
 
 
+def _low_rank_pair(out_dim: int, in_dim: int, rank: int) -> Tuple[nn.Parameter, nn.Parameter]:
+    a = nn.Parameter(torch.zeros(rank, in_dim))
+    nn.init.kaiming_uniform_(a, a=5 ** 0.5)
+    return a, nn.Parameter(torch.zeros(out_dim, rank))
+
+
 class LoRAWrapper(nn.Module):
-    """A Linear or 1x1 Conv2d plus a trainable low-rank residual (training only). B starts at zero."""
+    """A Linear or 1x1 Conv2d plus a trainable low-rank residual (training only). B starts at zero.
+
+    (A, B) is the student's delta; `aux_A` / `aux_B` an optional second one (`add_aux`). `active` picks the delta that
+    runs: "student" (default), "aux", or None for the host layer alone.
+    """
 
     def __init__(self, host: nn.Module, rank: int):
         super().__init__()
@@ -39,20 +55,23 @@ class LoRAWrapper(nn.Module):
         self.rank = rank
         for p in self.host.parameters():
             p.requires_grad = False
-        out_dim, in_dim = host.weight.shape[0], host.weight.shape[1]
-        self.A = nn.Parameter(torch.zeros(rank, in_dim))
-        self.B = nn.Parameter(torch.zeros(out_dim, rank))
-        nn.init.kaiming_uniform_(self.A, a=5 ** 0.5)
+        self.A, self.B = _low_rank_pair(host.weight.shape[0], host.weight.shape[1], rank)
+        self.aux_A: Optional[nn.Parameter] = None
+        self.aux_B: Optional[nn.Parameter] = None
+        self.active: Optional[str] = "student"
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = self.host(x)
+        if self.active is None:
+            return h
+        a, b = (self.A, self.B) if self.active == "student" else (self.aux_A, self.aux_B)
         # Under autocast the low-rank ops run in the autocast dtype; an fp32 copy of the activation would only cost
         # memory.
-        xa = x if torch.is_autocast_enabled() else x.to(self.A.dtype)
+        xa = x if torch.is_autocast_enabled() else x.to(a.dtype)
         if isinstance(self.host, nn.Linear):
-            r = F.linear(F.linear(xa, self.A), self.B)
+            r = F.linear(F.linear(xa, a), b)
         else:
-            r = F.conv2d(F.conv2d(xa, self.A[:, :, None, None]), self.B[:, :, None, None])
+            r = F.conv2d(F.conv2d(xa, a[:, :, None, None]), b[:, :, None, None])
         return h + r.to(h.dtype)
 
 
@@ -82,6 +101,31 @@ def attach(model: nn.Module, rank: int) -> Dict[str, LoRAWrapper]:
         w.A.requires_grad_(True)
         w.B.requires_grad_(True)
     return wrappers
+
+
+def add_aux(wrappers: Dict[str, LoRAWrapper], rank: int) -> List[nn.Parameter]:
+    """Give every wrapper a second trainable delta (B at zero, so it starts as the base model). Returns its
+    parameters."""
+    params: List[nn.Parameter] = []
+    for w in wrappers.values():
+        a, b = _low_rank_pair(w.host.weight.shape[0], w.host.weight.shape[1], rank)
+        w.aux_A = nn.Parameter(a.data.to(w.A.device))
+        w.aux_B = nn.Parameter(b.data.to(w.A.device))
+        params += [w.aux_A, w.aux_B]
+    return params
+
+
+@contextmanager
+def use(wrappers: Dict[str, LoRAWrapper], which: Optional[str]):
+    """Run the block with the given delta active in every wrapper ("student", "aux" or None), then restore."""
+    before = [w.active for w in wrappers.values()]
+    for w in wrappers.values():
+        w.active = which
+    try:
+        yield
+    finally:
+        for w, b in zip(wrappers.values(), before):
+            w.active = b
 
 
 def detach(model: nn.Module, wrappers: Dict[str, LoRAWrapper]) -> None:

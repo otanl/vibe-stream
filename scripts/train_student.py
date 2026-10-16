@@ -9,6 +9,14 @@ of each pair, decodes the same random crop with DC-AE (frame by frame, recompute
 three terms; the temporal term and its mask are in `vibe_stream.temporal_loss`. The student starts from the shared
 init noise and runs k first-order steps on VIBE's own k-step schedule.
 
+--w_dmd > 0 adds distribution matching distillation (DMD, Yin et al. 2024) on the student latents: they are re-noised
+at a random sigma, denoised by the teacher (the base weights; VIBE's DistilledCFG needs no guidance pass) and by a
+"fake score" model that is trained alongside to denoise the student's own outputs, and the student moves along
+(fake x0 - teacher x0), normalised per sample by |student - teacher x0|. Paired regression makes a student that
+cannot redraw the frame in k steps settle near the input; this term instead penalises outputs the teacher would not
+produce. The fake model is a second LoRA on the same frozen base (`lora.add_aux`), updated `--fake_updates` times per
+step on the step's student latents with fresh noise.
+
 Recipe of the released 2-step student (runs/lam4_2step): --student_steps 2 --lam 4 --grad_ckpt, 1500 steps,
 about 8 GB and 2 s/step (56 min) on an RTX 3090 Ti. One step: drop --grad_ckpt (16.5 GB, 1.0 s/step).
 
@@ -46,6 +54,12 @@ def main():
     p.add_argument("--crop", type=int, default=384, help="decoded crop in pixels (multiple of 32)")
     p.add_argument("--margin", type=int, default=32, help="crop border left out of LPIPS and the temporal term")
     p.add_argument("--grad_ckpt", action="store_true", help="transformer gradient checkpointing")
+    p.add_argument("--w_dmd", type=float, default=0.0, help="weight of the DMD term (0: off)")
+    p.add_argument("--fake_rank", type=int, default=32)
+    p.add_argument("--fake_lr", type=float, default=1e-4)
+    p.add_argument("--fake_updates", type=int, default=2, help="fake score updates per student step")
+    p.add_argument("--dmd_sigma", type=float, nargs=2, default=(0.02, 0.98), help="range of the re-noising sigma")
+    p.add_argument("--init", default=None, help="start the student from this LoRA file (same rank and noise)")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--log_every", type=int, default=50)
     p.add_argument("--no_save", action="store_true")
@@ -64,9 +78,20 @@ def main():
 
     m = VibeModel(size=size, keep_text_encoder=False)
     m.vae.requires_grad_(False)
+    dev = m.device
     wrappers = lora.attach(m.tr, a.rank)
+    if a.init:
+        state, _ = lora.load(a.init)
+        if lora.NOISE_KEY in state and not torch.equal(state[lora.NOISE_KEY].to(dev), m.noise):
+            raise SystemExit(f"{a.init} was trained on a different init noise")
+        lora.load_into(wrappers, state)
     params = [q for w in wrappers.values() for q in (w.A, w.B)]
     print(f"[train] {len(wrappers)} LoRA layers, {sum(q.numel() for q in params) / 1e6:.1f} M params", flush=True)
+    if a.w_dmd > 0:
+        fparams = lora.add_aux(wrappers, a.fake_rank)
+        fopt = torch.optim.AdamW(fparams, lr=a.fake_lr, weight_decay=0.0)
+        print(f"[train] DMD: weight {a.w_dmd}, fake score rank {a.fake_rank}, {a.fake_updates} updates/step, "
+              f"sigma {a.dmd_sigma[0]}-{a.dmd_sigma[1]}", flush=True)
     if a.grad_ckpt:
         m.tr.enable_gradient_checkpointing()
     lp = lpips.LPIPS(net="alex", verbose=False).to(m.device).eval().requires_grad_(False)
@@ -74,9 +99,40 @@ def main():
     sched = torch.optim.lr_scheduler.LambdaLR(
         opt, lambda s: min(1.0, (s + 1) / 50) * (0.5 * (1 + math.cos(math.pi * s / a.steps))))
     lat_n, cl, S, mg = size // 32, a.crop // 32, a.crop, a.margin
-    dev = m.device
     log = open(run / "log.jsonl", "w", encoding="utf-8")
-    acc = dict.fromkeys(("huber", "lpips", "temp", "temp_teacher"), 0.0)
+    acc = dict.fromkeys(("huber", "lpips", "temp", "temp_teacher") + (("dmd", "dmd_g", "fake") if a.w_dmd > 0 else ()), 0.0)
+
+    def renoise(x0):
+        """x0 re-noised at a random sigma per sample; returns (x_t, sigma, eps, VIBE timestep)."""
+        s = torch.empty(len(x0), 1, 1, 1, device=dev).uniform_(*a.dmd_sigma)
+        eps = torch.randn_like(x0)
+        # VIBE's timestep is 1000 sigma (its schedules pair t 999 with sigma 0.9997 and 749 with 0.7496)
+        return (1 - s) * x0 + s * eps, s, eps, s.flatten() * 1000
+
+    def dmd_term(x0, img_lat, emb):
+        """DMD loss on the student latents x0 (its gradient is the normalised fake - teacher x0) and mean |grad|."""
+        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+            x0d = x0.detach().float()
+            xt, s, _, t = renoise(x0d)
+            with lora.use(wrappers, None):
+                real = xt - s * m.velocity(xt, img_lat, emb, t)
+            with lora.use(wrappers, "aux"):
+                fake = xt - s * m.velocity(xt, img_lat, emb, t)
+            g = (fake - real) / (x0d - real).abs().mean(dim=(1, 2, 3), keepdim=True).clamp_min(1e-6)
+        return 0.5 * F.mse_loss(x0.float(), x0d - g), g.abs().mean()
+
+    def update_fake(x0d, img_lat, emb):
+        """Flow-matching steps for the fake score model on the student's latents. Returns the last loss."""
+        with lora.use(wrappers, "aux"):
+            for _ in range(a.fake_updates):
+                xt, _, eps, t = renoise(x0d)
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    l_f = F.mse_loss(m.velocity(xt, img_lat, emb, t), eps - x0d)
+                fopt.zero_grad(set_to_none=True)
+                l_f.backward()
+                torch.nn.utils.clip_grad_norm_(fparams, 1.0)
+                fopt.step()
+        return l_f
     t0 = time.perf_counter()
     for step in range(a.steps):
         items = [(random.choice(data), random.choice(keys), random.randrange(nfr - 1)) for _ in range(a.pairs)]
@@ -108,18 +164,26 @@ def main():
             t01 = (timg + 1) / 2
             l_tt = masked_warp_l1(t01[0::2], t01[1::2], flow, mask, mg)
         loss = l_lat + a.w_lp * l_lp + a.lam * l_t
+        terms = [("huber", l_lat), ("lpips", l_lp), ("temp", l_t), ("temp_teacher", l_tt)]
+        if a.w_dmd > 0:
+            l_dmd, g_abs = dmd_term(x0, img_lat, emb)
+            loss = loss + a.w_dmd * l_dmd
+            terms += [("dmd", l_dmd), ("dmd_g", g_abs)]
         opt.zero_grad(set_to_none=True)
-        loss.backward()
+        loss.backward()   # with the student's delta active: checkpointed blocks recompute with it
         torch.nn.utils.clip_grad_norm_(params, 1.0)
         opt.step()
         sched.step()
-        for key, val in (("huber", l_lat), ("lpips", l_lp), ("temp", l_t), ("temp_teacher", l_tt)):
+        if a.w_dmd > 0:
+            terms.append(("fake", update_fake(x0.detach().float(), img_lat, emb)))
+        for key, val in terms:
             acc[key] += val.item()
         if (step + 1) % a.log_every == 0:
             r = {k: v / a.log_every for k, v in acc.items()}
             el = time.perf_counter() - t0
+            dmd = f"dmd {r['dmd']:.4f} |g| {r['dmd_g']:.3f} fake {r['fake']:.4f}  " if a.w_dmd > 0 else ""
             print(f"[train] {step + 1:5d}/{a.steps} huber {r['huber']:.4f} lpips {r['lpips']:.4f} "
-                  f"temp {r['temp'] * 255:.2f} (teacher {r['temp_teacher'] * 255:.2f}, /255)  {el / (step + 1):.2f} s/step  "
+                  f"temp {r['temp'] * 255:.2f} (teacher {r['temp_teacher'] * 255:.2f}, /255)  {dmd}{el / (step + 1):.2f} s/step  "
                   f"peak {torch.cuda.max_memory_allocated() / 2**30:.1f} GB", flush=True)
             log.write(json.dumps({"step": step + 1, **r}) + "\n")
             log.flush()
@@ -130,7 +194,8 @@ def main():
     state[lora.NOISE_KEY] = m.noise.cpu().contiguous()
     lora.save(run / "lora.safetensors", state, dict(base="VIBE-Image-Edit-DistilledCFG", size=size, rank=a.rank, lam=a.lam,
                                                      student_steps=a.student_steps, w_lp=a.w_lp, steps=a.steps,
-                                                     prompts=prompts, teacher_steps=meta["teacher_steps"]))
+                                                     prompts=prompts, teacher_steps=meta["teacher_steps"],
+                                                     w_dmd=a.w_dmd, init=a.init))
     print(f"[train] saved {run / 'lora.safetensors'} after {time.perf_counter() - t0:.0f} s", flush=True)
 
 

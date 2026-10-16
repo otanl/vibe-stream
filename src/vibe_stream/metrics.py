@@ -8,6 +8,10 @@ The definitions follow dreamlite-stream's `metrics.py`, so numbers are comparabl
                   blurring, which shows up here.
   edge agreement  correlation of blurred Sobel magnitudes of input and output: how much of the source structure the
                   edit keeps.
+  clip_dir        CLIP directional similarity (as in InstructPix2Pix): cosine between the image-embedding change
+                  input -> output and the text-embedding change source caption -> target caption. How far an edit
+                  moved towards the instruction, whether or not it matches the teacher's picture. Not in
+                  dreamlite-stream.
 """
 
 from __future__ import annotations
@@ -114,3 +118,35 @@ class LPIPS:
                 ty = torch.from_numpy(y).to(self.device).permute(2, 0, 1)[None].float() / 127.5 - 1
                 vals.append(self.net(tx, ty).item())
         return float(np.mean(vals))
+
+
+class CLIPScore:
+    """CLIP ViT-L/14 (transformers) scores of an edit: `clip_dir` (see the module docstring) and `clip_t`, the cosine
+    between output and target caption. Means over frames."""
+
+    def __init__(self, model: str = "openai/clip-vit-large-patch14", device: str = "cuda"):
+        import torch
+        from transformers import CLIPModel, CLIPProcessor
+        self.torch = torch
+        self.device = device
+        self.model = CLIPModel.from_pretrained(model, torch_dtype=torch.float16).to(device).eval()
+        self.proc = CLIPProcessor.from_pretrained(model)
+
+    def _images(self, frames: Sequence[np.ndarray]):
+        x = self.proc(images=list(frames), return_tensors="pt")["pixel_values"].to(self.device, self.torch.float16)
+        f = self.model.get_image_features(pixel_values=x).float()
+        return f / f.norm(dim=-1, keepdim=True)
+
+    def _texts(self, texts: Sequence[str]):
+        x = self.proc(text=list(texts), return_tensors="pt", padding=True).to(self.device)
+        f = self.model.get_text_features(**x).float()
+        return f / f.norm(dim=-1, keepdim=True)
+
+    def __call__(self, inputs: Sequence[np.ndarray], outputs: Sequence[np.ndarray], source: str, target: str) -> dict:
+        torch = self.torch
+        with torch.no_grad():
+            fi, fo = self._images(inputs), self._images(outputs)
+            ts, tt = self._texts([source, target])
+            d_img, d_txt = fo - fi, tt - ts
+            cos_dir = (d_img @ d_txt) / (d_img.norm(dim=-1) * d_txt.norm() + 1e-8)
+            return dict(clip_dir=float(cos_dir.mean()), clip_t=float((fo @ tt).mean()))

@@ -43,6 +43,7 @@ SOFTWARE.
 | Sana 1.5 (the DiT VIBE starts from) | [NVlabs/Sana](https://github.com/NVlabs/Sana) | Apache-2.0 |
 | Qwen3-VL-2B (VIBE's text encoder) | [Qwen](https://huggingface.co/Qwen) | Apache-2.0 |
 | taesana weights | [madebyollin/taesd](https://github.com/madebyollin/taesd) | MIT |
+| CLIP ViT-L/14 (evaluation only, `metrics.CLIPScore`) | [openai/clip-vit-large-patch14](https://huggingface.co/openai/clip-vit-large-patch14) | MIT |
 | DAVIS-2017 clips used for training and evaluation | [davischallenge.org](https://davischallenge.org/davis2017/code.html) | see the DAVIS terms; not redistributed here |
 
 Check the publishers' current terms before redistributing weights or derived checkpoints (such as a trained student
