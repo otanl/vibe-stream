@@ -24,6 +24,7 @@ from vibe_stream.metrics import edge_agreement, read_video_frames, sobel, video_
 from vibe_stream.presets import PROMPTS
 from vibe_stream.stream import StreamEditor
 from vibe_stream.taesana import TinyAutoencoder
+from vibe_stream.temporal_filter import TemporalFilter
 from vibe_stream.vibe_model import VibeModel
 
 
@@ -40,6 +41,8 @@ def main():
     p.add_argument("--loop_frames", type=int, default=None, help="cycle the clip to this many frames")
     p.add_argument("--warmup_batches", type=int, default=2)
     p.add_argument("--compare", action="store_true", help="write input | output side by side")
+    p.add_argument("--temporal_filter", type=float, nargs=2, default=None, metavar=("LOW", "HIGH"),
+                   help="display-side temporal filter with these blend weights for the low and high band, e.g. 0.7 0.3")
     p.add_argument("--out_json", default=None)
     a = p.parse_args()
     prompt = PROMPTS.get(a.prompt, a.prompt)
@@ -58,13 +61,16 @@ def main():
     print(f"[input] {a.input}: {len(frames)} frames at {size}", flush=True)
     vibe = VibeModel(size=size)
     tae = TinyAutoencoder()
-    ed = StreamEditor(vibe, tae, engine=engine, student=a.student, batch_size=a.batch)
+    tf = TemporalFilter(*a.temporal_filter) if a.temporal_filter else None
+    ed = StreamEditor(vibe, tae, engine=engine, student=a.student, batch_size=a.batch, temporal_filter=tf)
     embed_ms = ed.set_prompt(prompt, frames[0])
     torch.cuda.reset_peak_memory_stats()
     run_frames = list(islice(cycle(frames), a.loop_frames)) if a.loop_frames else frames
     outs, tm = ed.run(run_frames, a.warmup_batches)
     outs = outs[:len(frames)]
     backend = f"TensorRT {engine.spec.tensorrt}" if engine else "PyTorch bf16"
+    if tf is not None:
+        backend += f", temporal filter {tf.low:g}/{tf.high:g}"
     print(f"[run] {backend}, {ed.steps}-step student, batch {ed.batch_size}, {len(run_frames)} frames", flush=True)
     print(f"[run] loop      {tm.loop_fps:6.1f} fps  ({tm.frames} frames in {tm.loop_s:.2f} s, steady state)")
     print(f"[run] step-only {tm.step_fps:6.1f} fps  ({mean(tm.step_ms) / ed.batch_size:.1f} ms per frame)")

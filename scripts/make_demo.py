@@ -23,6 +23,7 @@ from vibe_stream.metrics import read_video_frames, video_fps, write_video
 from vibe_stream.presets import EVAL_CLIPS_DIR, PROMPTS
 from vibe_stream.stream import StreamEditor
 from vibe_stream.taesana import TinyAutoencoder
+from vibe_stream.temporal_filter import TemporalFilter
 from vibe_stream.vibe_model import ROOT, VibeModel
 
 
@@ -63,6 +64,8 @@ def main():
     p.add_argument("--clips", nargs="*", default=None, help="clip names (default: every mp4 in --clips_dir)")
     p.add_argument("--prompts", nargs="+", default=list(PROMPTS), help="preset keys")
     p.add_argument("--max_frames", type=int, default=None)
+    p.add_argument("--temporal_filter", type=float, nargs=2, default=None, metavar=("LOW", "HIGH"),
+                   help="display-side temporal filter (vibe_stream.temporal_filter), e.g. 0.7 0.3")
     a = p.parse_args()
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -75,10 +78,13 @@ def main():
         engine = None
         size, backend = int(lora.load(a.student)[1].get("size", 768)), "PyTorch"
     vibe = VibeModel(size=size)
-    ed = StreamEditor(vibe, TinyAutoencoder(), engine=engine, student=a.student)
+    tf = TemporalFilter(*a.temporal_filter) if a.temporal_filter else None
+    ed = StreamEditor(vibe, TinyAutoencoder(), engine=engine, student=a.student, temporal_filter=tf)
     clips = a.clips or sorted(f.stem for f in Path(a.clips_dir).glob("*.mp4"))
     gpu = torch.cuda.get_device_name().replace("NVIDIA ", "").replace("GeForce ", "")
     footer = f"{ed.steps}-step VIBE student, {size}px, {backend}, {gpu}"
+    if tf is not None:
+        footer += f", temporal filter {tf.low:g}/{tf.high:g}"
     demo, fps = [], 24.0
     for clip in clips:
         src = Path(a.clips_dir) / f"{clip}.mp4"

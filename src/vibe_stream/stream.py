@@ -5,6 +5,9 @@ for the engine projected in fp32. Per batch only the tiny encoder, k transformer
 The transformer is either a TensorRT engine (`trt_engine.TRTTransformer`, the fast path) or VIBE's own PyTorch
 transformer in bf16 with the student merged.
 
+An optional `temporal_filter.TemporalFilter` blends each decoded batch with the previously shown frames along the
+input's optical flow; its flows are computed on the host while the GPU works on the previous batch.
+
 Throughput figures, defined as in dreamlite-stream:
   step-only  GPU time of `edit` (CUDA events) on uint8 frames already on the GPU.
   loop       wall time per batch in the steady state of `run`: host frames -> pinned buffer -> GPU -> edit -> host
@@ -23,6 +26,7 @@ import torch
 
 from . import lora as lora_mod
 from .taesana import TinyAutoencoder
+from .temporal_filter import TemporalFilter
 from .trt_engine import TRTTransformer
 from .vibe_model import VibeModel, flow_step
 
@@ -47,7 +51,7 @@ class StreamEditor:
     """Batched frame editor for one student. Give either `engine` (TensorRT) or `student` (a LoRA file, PyTorch)."""
 
     def __init__(self, vibe: VibeModel, tae: TinyAutoencoder, *, engine: Optional[TRTTransformer] = None,
-                 student=None, batch_size: int = 8):
+                 student=None, batch_size: int = 8, temporal_filter: Optional[TemporalFilter] = None):
         if (engine is None) == (student is None):
             raise ValueError("give exactly one of engine / student")
         self.vibe, self.tae, self.engine = vibe, tae, engine
@@ -74,6 +78,7 @@ class StreamEditor:
             self.prompts = meta.get("prompts", {})
         self.emb = None
         self.enc16 = None
+        self.tfilter = temporal_filter
         # TensorRT adds stream synchronisations when enqueued on the legacy default stream
         self.stream = torch.cuda.Stream(self.device)
 
@@ -83,6 +88,8 @@ class StreamEditor:
         torch.cuda.synchronize()
         t0 = time.perf_counter()
         self.emb = self.vibe.embed(prompt, frame)
+        if self.tfilter is not None:
+            self.tfilter.reset()
         if self.engine is not None:
             self.enc16 = self.vibe.project_embedding(self.emb).half().expand(self.batch_size, -1, -1).contiguous()
         torch.cuda.synchronize()
@@ -109,8 +116,11 @@ class StreamEditor:
         """Edit a list of RGB uint8 frames in batches; a short last batch is padded with its last frame.
 
         Double-buffered: batch b is copied into a pinned buffer while the GPU still works on batch b - 1, and the
-        host waits only for the result of b - 1 after b has been queued. Everything runs on `self.stream`.
+        host waits only for the result of b - 1 after b has been queued. Everything runs on `self.stream`. Each call
+        is one clip: the temporal filter, if any, starts afresh.
         """
+        if self.tfilter is not None:
+            self.tfilter.reset()
         self.stream.wait_stream(torch.cuda.current_stream(self.device))
         with torch.cuda.stream(self.stream):
             return self._run(frames, warmup_batches)
@@ -146,9 +156,12 @@ class StreamEditor:
             arr = pin_in[s].numpy()
             for j in range(B):
                 arr[j] = chunk[min(j, len(chunk) - 1)]
+            flows = self.tfilter.flows(arr) if self.tfilter is not None else None
             gpu = pin_in[s].to(self.device, non_blocking=True)
             ev0[s].record()
             out = self.edit(gpu)
+            if self.tfilter is not None:
+                out = self.tfilter(gpu, out, flows)
             ev1[s].record()
             pin_out[s].copy_(out, non_blocking=True)
             done[s].record()

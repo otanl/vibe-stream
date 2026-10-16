@@ -4,7 +4,9 @@ The definitions follow dreamlite-stream's `metrics.py`, so numbers are comparabl
 
   warping error   mean |out_t - warp(out_t+1, flow of the INPUT frames t -> t+1)| over the clip, 0-255 scale,
                   Farneback flow, no occlusion mask. Lower = less flicker.
-  sobel           mean |Sobel_xy(gray)|, a texture / sharpness probe: an output can lower its warping error by
+  flicker         the same change, only where the flow explains the input, and its low / high band split (`flicker`).
+                  Not in dreamlite-stream.
+  sobel          mean |Sobel_xy(gray)|, a texture / sharpness probe: an output can lower its warping error by
                   blurring, which shows up here.
   edge agreement  correlation of blurred Sobel magnitudes of input and output: how much of the source structure the
                   edit keeps.
@@ -84,6 +86,27 @@ def warping_error(inputs: Sequence[np.ndarray], outputs: Sequence[np.ndarray]) -
         flow = farneback(inputs[t], inputs[t + 1])
         errs.append(float(np.mean(np.abs(outputs[t].astype(np.float32) - _warp(outputs[t + 1].astype(np.float32), flow)))))
     return float(np.mean(errs)) if errs else 0.0
+
+
+def flicker(inputs: Sequence[np.ndarray], outputs: Sequence[np.ndarray], sigma: float = 4.0,
+            valid_below: float = 6.0) -> dict:
+    """Output change where the input's motion is explained, split into bands.
+
+    Like the warping error (Farneback flow on the input, output t+1 warped back to t), but averaged only over pixels
+    where the same warp reproduces the input to within `valid_below` (mean over RGB, 0-255): occlusions, motion blur
+    and flow failures are left out, so what remains is change the edit added. `low` / `high` split that change into
+    a Gaussian low band (sigma px: colour blotches, the scale of the 32-pixel latent tokens) and the rest (strokes,
+    grain). Returns dict(valid, low, high), each a clip mean on the 0-255 scale."""
+    v, lo, hi = [], [], []
+    for t in range(len(inputs) - 1):
+        flow = farneback(inputs[t], inputs[t + 1])
+        ok = np.abs(inputs[t].astype(np.float32) - _warp(inputs[t + 1].astype(np.float32), flow)).mean(2) < valid_below
+        a, b = outputs[t].astype(np.float32), _warp(outputs[t + 1].astype(np.float32), flow)
+        la, lb = cv2.GaussianBlur(a, (0, 0), sigma), cv2.GaussianBlur(b, (0, 0), sigma)
+        v.append(np.abs(a - b).mean(2)[ok].mean())
+        lo.append(np.abs(la - lb).mean(2)[ok].mean())
+        hi.append(np.abs((a - la) - (b - lb)).mean(2)[ok].mean())
+    return dict(valid=float(np.mean(v)), low=float(np.mean(lo)), high=float(np.mean(hi)))
 
 
 def sobel(frames: Sequence[np.ndarray]) -> float:
