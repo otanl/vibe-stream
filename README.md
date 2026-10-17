@@ -182,6 +182,8 @@ flow, `Carry.cut_below`); the runs below have no other keyframes.
 | `lam4_carry_2step_640` | plain | 20.7 / 12.2 | 12.5 / 13.5 | 22.1 | 12.7 | 0.214 / 0.174 |
 | | **carry-over** | **16.4 / 9.5** | 8.2 / 12.3 | 18.3 | **12.5** | **0.213 / 0.176** |
 | | carry-over + filter 0.7 / 0.3 | 11.5 / 6.6 | 5.0 / 9.3 | 13.8 | 10.5 | 0.209 / 0.172 |
+| `lam4_carry_s05_2step_640` | carry-over from sigma 0.5 | 14.4 / 8.1 | 6.8 / 11.2 | 16.5 | 11.9 | 0.209 / 0.179 |
+| | carry-over from sigma 0.5 + filter 0.7 / 0.3 | 10.2 / 5.7 | 4.3 / 8.4 | 12.7 | 10.1 | 0.205 / 0.175 |
 
 Against VIBE's 640 px 8-step output (`eval_student.py --size 640`, DC-AE path, as in the 640 table above):
 
@@ -219,6 +221,13 @@ Against VIBE's 640 px 8-step output (`eval_student.py --size 640`, DC-AE path, a
   (oil 21-25, anime 25-30) and stays there; in oil its Sobel and saturation match the 2-step path's throughout,
   and frame 470 is as sharp as frame 40. In anime it is more saturated than the 2-step path (about 60 against 40 in
   HSV saturation), greener foliage and water, which then stays put.
+- Starting the carried step lower (`--carry_sigma 0.5`, `lam4_carry_s05`; the step then sees the carried picture at
+  equal parts signal and noise) carries more: 14.4 / 8.1, for a little oil texture and edit strength (Sobel 11.9,
+  CLIP 0.209) and a little more anime edit strength (0.179). Most of the extra is again in the low band; the strokes
+  are still largely repainted (high band 11.2). With the filter it reaches 10.2 / 5.7 at CLIP 0.205 / 0.175, where
+  eq4 with the filter has 10.0 / 6.0 at 0.192 / 0.165. The long-run check behaves as at sigma 0.75 (plateau after
+  80 frames, nothing degrades). Where the flow fails, as on rippling water, the frame's own colours come through
+  the mix: `blackswan`'s pond stays green in anime, where the 2-step path paints it pale blue.
 
 ## Setup
 

@@ -31,9 +31,10 @@ away; this term asks for the teacher's amount of texture without asking for its 
 --w_carry > 0 trains the student for the carry-over of `vibe_stream.carry` as well: the student's own 2-step output
 for frame t of each pair (no gradient) is warped to a frame u up to --carry_gap frames later exactly as at run time
 (DIS flow at 320 px, photometric weight pooled to the latent grid, the frame itself where the flow fails), and the
-last step runs from it. That output gets the Huber and LPIPS terms against the teacher's frame u and lam times an L1
-against the warped output, weighted by the flow's weight. With probability --carry_rollout the carried output is
-itself carried once (through a frame between t and u), as in the steady state of the stream.
+last step runs from it (at --carry_sigma). That output gets the Huber and LPIPS terms against the teacher's frame u
+and --carry_lam (default lam) times an L1 against the warped output, weighted by the flow's weight. With probability
+--carry_rollout the carried output is itself carried once (through a frame between t and u), as in the steady state
+of the stream.
 
 Recipe of the released 2-step student (runs/lam4_2step): --student_steps 2 --lam 4 --grad_ckpt, 1500 steps,
 about 8 GB and 2 s/step (56 min) on an RTX 3090 Ti. One step: drop --grad_ckpt (16.5 GB, 1.0 s/step).
@@ -88,6 +89,8 @@ def main():
                    help="probability that the carried output is itself a carried one (one intermediate frame)")
     p.add_argument("--carry_sigma", type=float, default=None,
                    help="noise level the carried step starts from (default: the last step's, 0.7496 for 2 steps)")
+    p.add_argument("--carry_lam", type=float, default=None,
+                   help="weight of the carried step's temporal term (default: --lam)")
     p.add_argument("--init", default=None, help="start the student from this LoRA file (same rank and noise)")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--log_every", type=int, default=50)
@@ -288,7 +291,7 @@ def main():
             wc = torch.from_numpy(np.stack([w[Y:Y + S, X:X + S] for _, w in st])).to(dev)[:, None]
             err = ((dec_c.clamp(-1, 1) + 1) / 2 - g01).abs().mean(1, keepdim=True)[inner]
             l_ct = (err * wc[inner]).sum() / wc[inner].sum().clamp_min(1.0)
-            loss = loss + a.w_carry * (l_clat + a.w_lp * l_clp + a.lam * l_ct)
+            loss = loss + a.w_carry * (l_clat + a.w_lp * l_clp + (a.lam if a.carry_lam is None else a.carry_lam) * l_ct)
             terms += [("c_huber", l_clat), ("c_lpips", l_clp), ("c_temp", l_ct)]
         if a.w_dmd > 0:
             l_dmd, g_abs = dmd_term(x0, img_lat, emb)
@@ -326,7 +329,8 @@ def main():
                                                      prompts=prompts, teacher_steps=meta["teacher_steps"],
                                                      w_dmd=a.w_dmd, w_eq=a.w_eq, eq_shift=a.eq_shift,
                                                      w_tex=a.w_tex, w_carry=a.w_carry,
-                                                     carry_sigma=a.carry_sigma if a.w_carry > 0 else None, init=a.init))
+                                                     carry_sigma=a.carry_sigma if a.w_carry > 0 else None,
+                                                     carry_lam=a.carry_lam, init=a.init))
     print(f"[train] saved {run / 'lora.safetensors'} after {time.perf_counter() - t0:.0f} s", flush=True)
 
 
