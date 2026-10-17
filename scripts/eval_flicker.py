@@ -96,7 +96,7 @@ def evaluate(a):
     size = int(meta["size"])
     prompts = {k: v for k, v in meta.get("prompts", PROMPTS).items() if k in CLIP_CAPTIONS}
     vibe = VibeModel(size=size)
-    carry = Carry(a.keyframe_every, sigma=a.carry_sigma) if a.carry else None
+    carry = Carry(a.keyframe_every, tau=a.carry_tau, sigma=a.carry_sigma) if a.carry else None
     ed = StreamEditor(vibe, TinyAutoencoder(), student=a.student, carry=carry)
     frames = {c: read_video_frames(Path(a.clips_dir) / f"{c}.mp4", size, a.frames) for c in a.clips}
     res, vids = {"student": str(a.student), "filter": a.filter, "frames": a.frames, "clips": list(a.clips),
@@ -156,6 +156,8 @@ def main():
     p.add_argument("--keyframe_every", type=int, default=0, help="with --carry: a keyframe every N batches (0: first only)")
     p.add_argument("--carry_sigma", type=float, default=None,
                    help="with --carry: noise level of the carried start (default: the student's; give it with an engine)")
+    p.add_argument("--carry_tau", type=float, default=12.0,
+                   help="with --carry: tolerance of the flow check, in 8-bit levels (Carry.tau)")
     p.add_argument("--videos", action="store_true", help="also write input | plain | filtered per clip and prompt")
     p.add_argument("--table", nargs="+", metavar="JSON", help="print a table of earlier results and exit")
     a = p.parse_args()

@@ -184,6 +184,8 @@ flow, `Carry.cut_below`); the runs below have no other keyframes.
 | | carry-over + filter 0.7 / 0.3 | 11.5 / 6.6 | 5.0 / 9.3 | 13.8 | 10.5 | 0.209 / 0.172 |
 | `lam4_carry_s05_2step_640` | carry-over from sigma 0.5 | 14.4 / 8.1 | 6.8 / 11.2 | 16.5 | 11.9 | 0.209 / 0.179 |
 | | carry-over from sigma 0.5 + filter 0.7 / 0.3 | 10.2 / 5.7 | 4.3 / 8.4 | 12.7 | 10.1 | 0.205 / 0.175 |
+| `lam4_carry_s035_2step_640` | carry-over from sigma 0.35 | 13.4 / 7.7 | 6.5 / 10.3 | 15.6 | 11.4 | 0.205 / 0.180 |
+| | carry-over from sigma 0.35 + filter 0.7 / 0.3 | 9.5 / 5.4 | 4.1 / 7.8 | 12.0 | 9.7 | 0.201 / 0.175 |
 | `lam4_carry_s05_cl8_2step_640` | carry-over from sigma 0.5 | 13.6 / 7.8 | 6.7 / 10.3 | 15.6 | 10.9 | 0.205 / 0.178 |
 | | carry-over from sigma 0.5 + filter 0.7 / 0.3 | 9.6 / 5.4 | 4.2 / 7.8 | 11.9 | 9.2 | 0.201 / 0.174 |
 
@@ -228,8 +230,15 @@ Against VIBE's 640 px 8-step output (`eval_student.py --size 640`, DC-AE path, a
   CLIP 0.209) and a little more anime edit strength (0.179). Most of the extra is again in the low band; the strokes
   are still largely repainted (high band 11.2). With the filter it reaches 10.2 / 5.7 at CLIP 0.205 / 0.175, where
   eq4 with the filter has 10.0 / 6.0 at 0.192 / 0.165. The long-run check behaves as at sigma 0.75 (plateau after
-  80 frames, nothing degrades). Where the flow fails, as on rippling water, the frame's own colours come through
-  the mix: `blackswan`'s pond stays green in anime, where the 2-step path paints it pale blue.
+  80 frames, nothing degrades). In anime, `blackswan`'s pond is green (the source's colour) by frame 40 and stays
+  so, where the 2-step path paints it pale blue. This is not the frame being mixed in where the flow fails: the
+  flow check passes as much of the pond as of the rest of the picture (mean w 0.55 in the lower half of the frame,
+  0.53 overall), and a looser check (`eval_flicker.py --carry_tau 24`, 48, against 12) leaves the pond green while
+  costing edit strength (CLIP 0.208 / 0.175 and 0.201 / 0.170) without changing flicker (14.6 / 8.0, 14.8 / 7.9);
+  at 48 the moving figure in `parkour` leaves ghosts.
+- Lower still (`--carry_sigma 0.35`) the gain halves: 13.4 / 7.7, with Sobel 11.9 to 11.4 and CLIP oil 0.209 to
+  0.205 (anime 0.180). Texture goes at about the rate the filter spends it, oil edit strength faster, so the sigma
+  series has levelled off at 0.5. The long-run check behaves as before.
 - Raising the carried step's temporal weight to 8 so that it keeps the strokes too (`--carry_lam 8`, default lam;
   `lam4_carry_s05_cl8`) lowers the high band from 11.2 to 10.3, but by smoothing the strokes rather than holding
   them: Sobel 11.9 to 10.9 and CLIP oil 0.209 to 0.205 for 14.4 to 13.6. That is a worse exchange than the filter's
