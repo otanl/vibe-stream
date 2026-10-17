@@ -29,13 +29,17 @@ from vibe_stream.vibe_model import ROOT, VibeModel
 
 
 def label(img: np.ndarray, text: str, bottom: bool = False) -> np.ndarray:
-    """img with `text` in white on a black box, top-left (or bottom-left)."""
+    """img with `text` (lines separated by newlines) in white on a black box, top-left (or bottom-left)."""
     img = img.copy()
     scale = img.shape[0] / 1200
-    (w, h), base = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, 1)
-    y0 = img.shape[0] - (h + base + 14) if bottom else 0
-    cv2.rectangle(img, (0, y0), (w + 16, y0 + h + base + 14), (0, 0, 0), -1)
-    cv2.putText(img, text, (8, y0 + h + 7), cv2.FONT_HERSHEY_SIMPLEX, scale, (255, 255, 255), 1, cv2.LINE_AA)
+    lines = text.split("\n")
+    sizes = [cv2.getTextSize(t, cv2.FONT_HERSHEY_SIMPLEX, scale, 1) for t in lines]
+    lh = max(h + base for (_, h), base in sizes) + 6
+    bw, bh = max(w for (w, _), _ in sizes) + 16, lh * len(lines) + 8
+    y0 = img.shape[0] - bh if bottom else 0
+    cv2.rectangle(img, (0, y0), (bw, y0 + bh), (0, 0, 0), -1)
+    for i, (t, ((_, h), _)) in enumerate(zip(lines, sizes)):
+        cv2.putText(img, t, (8, y0 + i * lh + h + 7), cv2.FONT_HERSHEY_SIMPLEX, scale, (255, 255, 255), 1, cv2.LINE_AA)
     return img
 
 
@@ -71,7 +75,8 @@ def main():
                    help="start batches after a keyframe from the previous output (vibe_stream.carry)")
     p.add_argument("--keyframe_every", type=int, default=0, help="with --carry: a keyframe every N batches (0: first only)")
     p.add_argument("--carry_sigma", type=float, default=None,
-                   help="with --carry: noise level of the carried start (default: the student's; give it with an engine)")
+                   help="with --carry: noise level of the carried start "
+                        "(default: the student's, as recorded in it or in the engine's spec)")
     a = p.parse_args()
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -90,10 +95,10 @@ def main():
     clips = a.clips or sorted(f.stem for f in Path(a.clips_dir).glob("*.mp4"))
     gpu = torch.cuda.get_device_name().replace("NVIDIA ", "").replace("GeForce ", "")
     footer = f"{ed.steps}-step VIBE student, {size}px, {backend}, {gpu}"
-    if tf is not None:
-        footer += f", temporal filter {tf.low:g}/{tf.high:g}"
-    if ed.carry is not None:
-        footer += ", carry-over"
+    options = (["carry-over"] if ed.carry is not None else []) + (
+        [f"temporal filter {tf.low:g}/{tf.high:g}"] if tf is not None else [])
+    if options:
+        footer += "\n" + " + ".join(options)
     demo, fps = [], 24.0
     for clip in clips:
         src = Path(a.clips_dir) / f"{clip}.mp4"

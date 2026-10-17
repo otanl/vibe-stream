@@ -155,7 +155,8 @@ def main():
     p.add_argument("--carry", action="store_true", help="stream with the carry-over (vibe_stream.carry)")
     p.add_argument("--keyframe_every", type=int, default=0, help="with --carry: a keyframe every N batches (0: first only)")
     p.add_argument("--carry_sigma", type=float, default=None,
-                   help="with --carry: noise level of the carried start (default: the student's; give it with an engine)")
+                   help="with --carry: noise level of the carried start "
+                        "(default: the student's, as recorded in it or in the engine's spec)")
     p.add_argument("--carry_tau", type=float, default=12.0,
                    help="with --carry: tolerance of the flow check, in 8-bit levels (Carry.tau)")
     p.add_argument("--videos", action="store_true", help="also write input | plain | filtered per clip and prompt")

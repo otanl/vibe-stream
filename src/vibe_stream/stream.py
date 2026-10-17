@@ -86,8 +86,9 @@ class StreamEditor:
         if carry is not None and self.steps < 2:
             raise ValueError("the carry-over needs a student with at least 2 steps")
         self.carry = carry
-        # the noise level a student was trained to start its carried step from (an engine's spec does not record it)
-        self.trained_carry_sigma = None if engine is not None else meta.get("carry_sigma")
+        # the noise level a student was trained to start its carried step from (engines built before it was recorded
+        # in the spec have None)
+        self.trained_carry_sigma = engine.spec.carry_sigma if engine is not None else meta.get("carry_sigma")
         self._t_carry = {}
         # TensorRT adds stream synchronisations when enqueued on the legacy default stream
         self.stream = torch.cuda.Stream(self.device)
@@ -116,7 +117,8 @@ class StreamEditor:
             return (self.t_engine[i] if self.engine is not None else self.timesteps[i]), self.sigmas[-2]
         s = float(s)
         if s not in self._t_carry:
-            self._t_carry[s] = (torch.full((self.batch_size,), 1000.0 * s, dtype=torch.float32, device=self.device)
+            self._t_carry[s] = (torch.full((self.batch_size,), 1000.0 * s * self.vibe.tscale, dtype=torch.float32,
+                                           device=self.device)
                                 if self.engine is not None else torch.tensor(1000.0 * s, device=self.device))
         return self._t_carry[s], s
 

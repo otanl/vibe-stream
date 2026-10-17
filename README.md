@@ -112,7 +112,10 @@ The options of the next section, same run at 640 (TensorRT engine, loop / step-o
 | carry-over + temporal filter | 45.2 | 45.7 |
 
 The filter's optical flow runs on the host behind the GPU; its blend costs about 1 ms per frame on the GPU. The
-carry-over's flows are hidden the same way.
+carry-over's flows are hidden the same way. The engine of `lam4_carry_s05_2step_640` (Flicker; `build_trt.py` copies
+the student's `carry_sigma` 0.5 into the spec, which `StreamEditor` reads) runs the same loop at 29.6, 47.8 and
+44.1 fps (2 steps, carry-over, carry-over + filter). Its output differs from PyTorch bf16 by 0.81 in mean absolute
+value on the carried step (`blackswan`, oil, 40 frames) and by 1.16 on the 2-step path.
 
 ### Flicker (640, streaming path)
 
@@ -273,7 +276,7 @@ python scripts/stream_video.py --input assets/davis_mp4/blackswan.mp4 --prompt o
 # ... or with PyTorch only
 python scripts/stream_video.py --input ... --student runs/lam4_2step/lora.safetensors
 # ... with the display-side temporal filter and / or the carry-over (any of these scripts, including make_demo.py);
-# with an engine, --carry_sigma must repeat a non-default value the student was trained with
+# a student trained for another start of the carried step (--carry_sigma) records it, and so does its engine
 python scripts/stream_video.py --input ... --engine ... --temporal_filter 0.7 0.3 --carry
 # Flicker of a student, plain and filtered, and the shift probe; --table compares result files
 python scripts/eval_flicker.py --student runs/lam4_2step_640/lora.safetensors --out out/flicker/lam4_2step_640.json
