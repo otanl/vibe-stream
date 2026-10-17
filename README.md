@@ -10,8 +10,9 @@ or MIT (see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)), and VIBE's still-
 DreamLite-mobile's: styles are about equal and instruction edits are clearly better.
 
 **Status: research code.** Two students are trained (2 steps, two style prompts, at 768 and at 640 px); the whole
-streaming loop runs at 21.0 fps at 768 and 29.1 fps at 640 on an RTX 3090 Ti. The numbers below say what has been
-measured and how.
+streaming loop runs at 21.0 fps at 768 and 29.1 fps at 640 on an RTX 3090 Ti. A student trained to carry the
+previous output over into the next batch (one transformer call per frame) runs at 47.8 fps at 640 with less flicker
+and the same edit strength ("Flicker"). The numbers below say what has been measured and how.
 
 ## Demo
 
@@ -101,6 +102,18 @@ Step-only and loop fps are defined as in dreamlite-stream (`src/vibe_stream/stre
 dreamlite-stream's lean path with its one-step LoRA and TensorRT UNet runs at 25 fps loop at 768. The remaining cost is the transformer (2 steps); a one-step student would run at about 30 ms per
 frame at 768 but loses edit strength (table above), and DMD does not win it back (Negative results).
 
+The options of the next section, same run at 640 (TensorRT engine, loop / step-only fps):
+
+| 640, 480-frame loop | Loop fps | Step-only fps |
+|---|---:|---:|
+| 2 steps per frame | 29.6 | 29.6 |
+| + temporal filter 0.7 / 0.3 | 28.7 | 28.6 |
+| carry-over (one transformer call per frame after the first batch) | 47.8 | 48.1 |
+| carry-over + temporal filter | 45.2 | 45.7 |
+
+The filter's optical flow runs on the host behind the GPU; its blend costs about 1 ms per frame on the GPU. The
+carry-over's flows are hidden the same way.
+
 ### Flicker (640, streaming path)
 
 `scripts/eval_flicker.py`: DAVIS `blackswan`, `parkour`, `dance-twirl`, `camel`, `goat` and `libby`, first 40 frames,
@@ -120,21 +133,39 @@ the unshifted output moved by the same offset (0 = the output moves with the con
 | `lam4_2step_640` | 3.5 | 5.6 | 8.5 | 11.1 | 14.3 | 18.3 | 19.3 | 6.5 |
 | `lam8_2step_640` | 2.7 | 4.0 | 6.3 | 8.6 | 11.1 | 13.8 | 14.8 | 4.8 |
 | `lam4_eq4_2step_640` | 2.5 | 3.7 | 5.7 | 7.8 | 10.0 | 12.4 | 13.1 | 4.3 |
+| `lam4_eq8_2step_640` | 2.1 | 2.7 | 4.2 | 5.9 | 7.6 | 9.0 | 9.8 | 3.1 |
 
 On the released student a one-pixel shift already changes the output by 5.6; rolling the noise along with a
 whole-token shift removes two thirds of the change at 32 px, so the shared noise is most of it. But motion between
 frames is mostly a few pixels, and noise cannot follow sub-token motion (Negative results). What can be changed is
-the student (the two rows below it, described next) and the display.
+the student (the rows below it, described next) and the display.
 
 **Students and the display filter.** `lam8`: the temporal weight doubled. `eq4`: lam 4 plus a shift-equivariance
 term (`train_student.py --w_eq 4`): the first frame of a pair is also shifted by a random sub-token offset
 (up to 16 px), and its output must equal the unshifted output moved by the same offset, an exact correspondence
-instead of the input flow. *Filter*: `temporal_filter.TemporalFilter(0.7, 0.3)` on the decoded frames
-(`--temporal_filter 0.7 0.3`): the output is split at a Gaussian of sigma 6 px and each band is blended with the
-previous shown frame warped by the input's flow (DIS at 320 px), 0.7 of the previous frame in the low band and
-0.3 in the high band, turned off where the warp does not reproduce the input.
+instead of the input flow; `eq8` the same with weight 8. `lam8_tex8`: lam 8 plus a texture-amount term
+(`--w_tex 8`): L1 between the local amplitude of detail of the output and of the teacher (energy above a sigma-2
+blur, averaged over sigma 8 px), which asks for the teacher's amount of texture but not its placement.
 
-| Student | Display | Valid oil / anime | Low / high (oil) | Warp oil | Sobel oil | CLIP dir oil / anime |
+*Filter*: `temporal_filter.TemporalFilter(0.7, 0.3)` on the decoded frames (`--temporal_filter 0.7 0.3`): the
+output is split at a Gaussian of sigma 6 px and each band is blended with the previous shown frame warped by the
+input's flow (DIS at 320 px), 0.7 of the previous frame in the low band and 0.3 in the high band, turned off where
+the warp does not reproduce the input.
+
+*Carry-over* (`carry.Carry`, `--carry`): after a keyframe batch (2 steps from noise), each batch skips step 1 and
+starts step 2 from the previous batch's last output warped to each frame by the input's flow, mixed on the latent
+grid with the frame itself where the flow does not hold (occlusions, new content), at step 2's noise level
+(sigma 0.75). It is the division of labour between the steps carried over time: step 1 decides composition and
+colour areas, and those come from the previous output instead of being decided afresh. One transformer call per
+frame. `lam4_carry` is trained for it (`--w_carry 1`): the student's own output, warped to a frame 1-8 frames later
+as at run time (and with probability 0.5 carried once more through a frame in between), is the start of a step that
+gets the Huber and LPIPS terms against the teacher and lam times an L1 against the warped output; the usual pair
+terms stay, so its 2-step path still serves keyframes. Keyframes come at the start and at cuts (detected from the
+flow, `Carry.cut_below`); the runs below have no other keyframes.
+
+*Plain* is the 2-step path without the filter.
+
+| Student | Path / display | Valid oil / anime | Low / high (oil) | Warp oil | Sobel oil | CLIP dir oil / anime |
 |---|---|---:|---:|---:|---:|---:|
 | `lam4_2step_640` (released) | plain | 20.9 / 12.2 | 12.6 / 13.7 | 22.3 | 13.1 | 0.213 / 0.175 |
 | | filter 0.7 / 0.3 | 14.0 / 8.1 | 7.3 / 10.3 | 15.9 | 11.2 | 0.208 / 0.165 |
@@ -143,6 +174,14 @@ previous shown frame warped by the input's flow (DIS at 320 px), 0.7 of the prev
 | | filter 0.7 / 0.3 | 11.0 / 6.6 | 5.6 / 8.2 | 12.6 | 8.9 | 0.198 / 0.165 |
 | `lam4_eq4_2step_640` | plain | 14.8 / 8.9 | 8.7 / 9.9 | 15.9 | 9.6 | 0.196 / 0.173 |
 | | filter 0.7 / 0.3 | 10.0 / 6.0 | 5.1 / 7.5 | 11.5 | 8.2 | 0.192 / 0.165 |
+| `lam4_eq8_2step_640` | plain | 11.0 / 6.9 | 6.3 / 7.6 | 12.0 | 7.6 | 0.183 / 0.174 |
+| | filter 0.7 / 0.3 | 7.5 / 4.7 | 3.7 / 5.8 | 8.8 | 6.4 | 0.181 / 0.166 |
+| `lam8_tex8_2step_640` | plain | 20.3 / 11.6 | 11.2 / 14.4 | 21.8 | 15.0 | 0.215 / 0.175 |
+| | filter 0.7 / 0.3 | 13.9 / 7.9 | 6.6 / 10.8 | 15.9 | 12.6 | 0.209 / 0.167 |
+| `lam4_2step_640` (not trained for it) | carry-over | 12.8 / 8.8 | 6.8 / 9.4 | 15.4 | 8.8 | 0.192 / 0.166 |
+| `lam4_carry_2step_640` | plain | 20.7 / 12.2 | 12.5 / 13.5 | 22.1 | 12.7 | 0.214 / 0.174 |
+| | **carry-over** | **16.4 / 9.5** | 8.2 / 12.3 | 18.3 | **12.5** | **0.213 / 0.176** |
+| | carry-over + filter 0.7 / 0.3 | 11.5 / 6.6 | 5.0 / 9.3 | 13.8 | 10.5 | 0.209 / 0.172 |
 
 Against VIBE's 640 px 8-step output (`eval_student.py --size 640`, DC-AE path, as in the 640 table above):
 
@@ -155,14 +194,31 @@ Against VIBE's 640 px 8-step output (`eval_student.py --size 640`, DC-AE path, a
 - Both training changes buy steadiness with texture and edit strength, and at the same rate: the line from lam 4
   through lam 8, extended to eq4's warping error, predicts eq4's Sobel, LPIPS and CLIP oil in the teacher comparison
   to within 0.1, 0.004 and 0.004. The equivariance term does not move the trade-off, and it doubles the training
-  time (3.0 s/step).
-- The display filter does better than either: on the released student it takes flicker from 20.9 to 14.0 (oil) and
+  time (3.0 s/step). Weight 8 goes further along the same line for oil (CLIP 0.183). Anime is the exception: its
+  CLIP score stays at 0.174 down to eq8's 6.9, a cel-shaded picture having little texture to lose.
+- The texture term does move it: with lam 8 it keeps the released student's flicker (20.3 against 20.9) with more
+  texture (Sobel 15.0 against 13.1; the lam line predicts 12.8 at that flicker) and the same edit strength. It spends
+  the stronger temporal weight on texture instead of steadiness.
+- The display filter does better than lam or the equivariance term: on the released student it takes flicker from 20.9 to 14.0 (oil) and
   keeps Sobel 11.2 and CLIP 0.208, where training to about that level (eq4, 14.8) costs Sobel 9.6 and CLIP 0.196.
   Most of the gain is in the low band (12.6 to 7.3: the token-sized colour blotches); the light high-band blend
   keeps the strokes. A stronger setting (0.85 / 0.5) reaches lam 8's filtered flicker on the released student with
   more texture and oil edit strength (Sobel 10.1 against 8.9, CLIP 0.204 against 0.198), though anime loses a little
   (0.159 against 0.165). It works on any student and stacks with them. Single frames of the 0.7 / 0.3 output look like
   the plain ones with slightly softer strokes, with no double edges on the moving figures of these clips.
+- The carry-over is the first change that buys steadiness without paying for it: the trained student's carry-over
+  path has lam 8's flicker (16.4 / 9.5 against 16.3 / 9.8) with the released student's texture and edit strength
+  (Sobel 12.5, CLIP 0.213 / 0.176), and it runs at 47.8 fps instead of 29.6 (Speed). Its 2-step path, used for
+  keyframes, is unchanged (20.7 / 12.2, CLIP 0.214 / 0.174). Without the training the carry-over steadies more but
+  loses style (CLIP 0.192 / 0.166, Sobel 8.8, as in Negative results): the trained student repaints more of what it
+  is handed. What it carries is the low band (12.6 to 8.2); at sigma 0.75 the carried picture is mostly noise to the
+  step, so the strokes are still repainted every frame (high band 13.7 to 12.3). With the filter on top: 11.5 / 6.6
+  at Sobel 10.5 and CLIP 0.209 / 0.172, the best anime edit strength of any filtered row.
+- It does not drift on long runs. `blackswan` and `goat` played back and forth to 480 frames, one keyframe at the
+  start: the carry-over output's distance to the 2-step output of the same frame settles after about 100 frames
+  (oil 21-25, anime 25-30) and stays there; in oil its Sobel and saturation match the 2-step path's throughout,
+  and frame 470 is as sharp as frame 40. In anime it is more saturated than the 2-step path (about 60 against 40 in
+  HSV saturation), greener foliage and water, which then stays put.
 
 ## Setup
 
@@ -189,8 +245,9 @@ python scripts/stream_video.py --input assets/davis_mp4/blackswan.mp4 --prompt o
     --engine out/trt/vibe_lam4_2step_768_b8.engine --output out/stream/blackswan_oil.mp4 --compare
 # ... or with PyTorch only
 python scripts/stream_video.py --input ... --student runs/lam4_2step/lora.safetensors
-# ... with the display-side temporal filter (any of these scripts, including make_demo.py)
-python scripts/stream_video.py --input ... --engine ... --temporal_filter 0.7 0.3
+# ... with the display-side temporal filter and / or the carry-over (any of these scripts, including make_demo.py);
+# with an engine, --carry_sigma must repeat a non-default value the student was trained with
+python scripts/stream_video.py --input ... --engine ... --temporal_filter 0.7 0.3 --carry
 # Flicker of a student, plain and filtered, and the shift probe; --table compares result files
 python scripts/eval_flicker.py --student runs/lam4_2step_640/lora.safetensors --out out/flicker/lam4_2step_640.json
 # Demo video: input | oil | anime for every clip in assets/davis_mp4 through the same path (H.264 if ffmpeg is on PATH)
@@ -206,6 +263,11 @@ python scripts/eval_student.py --out out/eval --runs runs/lam4_2step --base
 python scripts/make_teacher_data.py --out data/teacher_640 --size 640
 python scripts/train_student.py --data data/teacher_640 --run runs/lam4_2step_640 --student_steps 2 --lam 4 --grad_ckpt
 python scripts/eval_student.py --size 640 --out out/eval_640 --runs runs/lam4_2step_640
+# ... trained for the carry-over as well (~71 min at 2.8 s/step)
+python scripts/train_student.py --data data/teacher_640 --run runs/lam4_carry_2step_640 --student_steps 2 --lam 4 \
+    --w_carry 1 --grad_ckpt
+python scripts/eval_flicker.py --student runs/lam4_carry_2step_640/lora.safetensors --carry \
+    --out out/flicker/lam4_carry_2step_640_carry.json
 ```
 
 A student is tied to its resolution, its init noise (stored in the file) and, in practice, the prompts it was
@@ -222,6 +284,7 @@ one TensorRT version and platform; `<engine>.json` records them and a mismatch i
   - `trt_engine.py`: ONNX export, engine build, runtime wrapper
   - `stream.py`: batched, double-buffered streaming editor
   - `temporal_filter.py`: display-side two-band temporal filter
+  - `carry.py`: carry-over of the previous output into the next batch's start
   - `metrics.py`: video I/O, warping error, flicker split, Sobel, edge agreement, LPIPS, CLIP scores
 - `scripts/`: one entry point per step above.
 
@@ -269,7 +332,8 @@ one TensorRT version and platform; `<engine>.json` records them and a mismatch i
   | Full-band blend of the output with the warped previous output, 50/50 | 12.3 / 7.3 | 0.203 / 0.163 | 9.7 |
 
   The two-band display filter ("Flicker" above: 14.0 / 8.1, Sobel 11.2, CLIP 0.208 / 0.165) keeps more texture than
-  the full-band blend for slightly more flicker.
+  the full-band blend for slightly more flicker. The third row, with a student trained for it, became the carry-over
+  ("Flicker" above), which keeps the style.
 
 ## Reference: SANA-Streaming
 
