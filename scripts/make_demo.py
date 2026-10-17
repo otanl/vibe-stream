@@ -19,6 +19,7 @@ import torch
 
 import _paths  # noqa: F401
 from vibe_stream import lora
+from vibe_stream.carry import Carry
 from vibe_stream.metrics import read_video_frames, video_fps, write_video
 from vibe_stream.presets import EVAL_CLIPS_DIR, PROMPTS
 from vibe_stream.stream import StreamEditor
@@ -66,6 +67,11 @@ def main():
     p.add_argument("--max_frames", type=int, default=None)
     p.add_argument("--temporal_filter", type=float, nargs=2, default=None, metavar=("LOW", "HIGH"),
                    help="display-side temporal filter (vibe_stream.temporal_filter), e.g. 0.7 0.3")
+    p.add_argument("--carry", action="store_true",
+                   help="start batches after a keyframe from the previous output (vibe_stream.carry)")
+    p.add_argument("--keyframe_every", type=int, default=0, help="with --carry: a keyframe every N batches (0: first only)")
+    p.add_argument("--carry_sigma", type=float, default=None,
+                   help="with --carry: noise level of the carried start (default: the student's; give it with an engine)")
     a = p.parse_args()
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -79,12 +85,15 @@ def main():
         size, backend = int(lora.load(a.student)[1].get("size", 768)), "PyTorch"
     vibe = VibeModel(size=size)
     tf = TemporalFilter(*a.temporal_filter) if a.temporal_filter else None
-    ed = StreamEditor(vibe, TinyAutoencoder(), engine=engine, student=a.student, temporal_filter=tf)
+    ed = StreamEditor(vibe, TinyAutoencoder(), engine=engine, student=a.student, temporal_filter=tf,
+                      carry=Carry(a.keyframe_every, sigma=a.carry_sigma) if a.carry else None)
     clips = a.clips or sorted(f.stem for f in Path(a.clips_dir).glob("*.mp4"))
     gpu = torch.cuda.get_device_name().replace("NVIDIA ", "").replace("GeForce ", "")
     footer = f"{ed.steps}-step VIBE student, {size}px, {backend}, {gpu}"
     if tf is not None:
         footer += f", temporal filter {tf.low:g}/{tf.high:g}"
+    if ed.carry is not None:
+        footer += ", carry-over"
     demo, fps = [], 24.0
     for clip in clips:
         src = Path(a.clips_dir) / f"{clip}.mp4"

@@ -20,6 +20,7 @@ import torch
 
 import _paths  # noqa: F401
 from vibe_stream import lora
+from vibe_stream.carry import Carry
 from vibe_stream.metrics import edge_agreement, read_video_frames, sobel, video_fps, warping_error, write_video
 from vibe_stream.presets import PROMPTS
 from vibe_stream.stream import StreamEditor
@@ -43,6 +44,11 @@ def main():
     p.add_argument("--compare", action="store_true", help="write input | output side by side")
     p.add_argument("--temporal_filter", type=float, nargs=2, default=None, metavar=("LOW", "HIGH"),
                    help="display-side temporal filter with these blend weights for the low and high band, e.g. 0.7 0.3")
+    p.add_argument("--carry", action="store_true",
+                   help="start batches after a keyframe from the previous output (vibe_stream.carry)")
+    p.add_argument("--keyframe_every", type=int, default=0, help="with --carry: a keyframe every N batches (0: first only)")
+    p.add_argument("--carry_sigma", type=float, default=None,
+                   help="with --carry: noise level of the carried start (default: the student's; give it with an engine)")
     p.add_argument("--out_json", default=None)
     a = p.parse_args()
     prompt = PROMPTS.get(a.prompt, a.prompt)
@@ -62,7 +68,8 @@ def main():
     vibe = VibeModel(size=size)
     tae = TinyAutoencoder()
     tf = TemporalFilter(*a.temporal_filter) if a.temporal_filter else None
-    ed = StreamEditor(vibe, tae, engine=engine, student=a.student, batch_size=a.batch, temporal_filter=tf)
+    ed = StreamEditor(vibe, tae, engine=engine, student=a.student, batch_size=a.batch, temporal_filter=tf,
+                      carry=Carry(a.keyframe_every, sigma=a.carry_sigma) if a.carry else None)
     embed_ms = ed.set_prompt(prompt, frames[0])
     torch.cuda.reset_peak_memory_stats()
     run_frames = list(islice(cycle(frames), a.loop_frames)) if a.loop_frames else frames
@@ -71,6 +78,8 @@ def main():
     backend = f"TensorRT {engine.spec.tensorrt}" if engine else "PyTorch bf16"
     if tf is not None:
         backend += f", temporal filter {tf.low:g}/{tf.high:g}"
+    if ed.carry is not None:
+        backend += f", carry-over ({ed.carry.keyframes} keyframe batches of {-(-len(run_frames) // ed.batch_size)})"
     print(f"[run] {backend}, {ed.steps}-step student, batch {ed.batch_size}, {len(run_frames)} frames", flush=True)
     print(f"[run] loop      {tm.loop_fps:6.1f} fps  ({tm.frames} frames in {tm.loop_s:.2f} s, steady state)")
     print(f"[run] step-only {tm.step_fps:6.1f} fps  ({mean(tm.step_ms) / ed.batch_size:.1f} ms per frame)")

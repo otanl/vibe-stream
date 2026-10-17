@@ -26,6 +26,7 @@ import torch
 
 import _paths  # noqa: F401
 from vibe_stream import lora
+from vibe_stream.carry import Carry
 from vibe_stream.metrics import CLIPScore, flicker, read_video_frames, sobel, warping_error, write_video
 from vibe_stream.presets import CLIP_CAPTIONS, EVAL_CLIPS_DIR, PROMPTS
 from vibe_stream.stream import StreamEditor
@@ -95,9 +96,11 @@ def evaluate(a):
     size = int(meta["size"])
     prompts = {k: v for k, v in meta.get("prompts", PROMPTS).items() if k in CLIP_CAPTIONS}
     vibe = VibeModel(size=size)
-    ed = StreamEditor(vibe, TinyAutoencoder(), student=a.student)
+    carry = Carry(a.keyframe_every, sigma=a.carry_sigma) if a.carry else None
+    ed = StreamEditor(vibe, TinyAutoencoder(), student=a.student, carry=carry)
     frames = {c: read_video_frames(Path(a.clips_dir) / f"{c}.mp4", size, a.frames) for c in a.clips}
-    res, vids = {"student": str(a.student), "filter": a.filter, "frames": a.frames, "clips": list(a.clips)}, {}
+    res, vids = {"student": str(a.student), "filter": a.filter, "frames": a.frames, "clips": list(a.clips),
+                 "carry": a.keyframe_every if a.carry else None}, {}
     for c, fr in frames.items():
         for key, prompt in prompts.items():
             ed.set_prompt(prompt, fr[0])
@@ -149,6 +152,10 @@ def main():
     p.add_argument("--clips_dir", default=str(ROOT / EVAL_CLIPS_DIR))
     p.add_argument("--frames", type=int, default=40)
     p.add_argument("--filter", type=float, nargs=2, default=(0.7, 0.3), metavar=("LOW", "HIGH"))
+    p.add_argument("--carry", action="store_true", help="stream with the carry-over (vibe_stream.carry)")
+    p.add_argument("--keyframe_every", type=int, default=0, help="with --carry: a keyframe every N batches (0: first only)")
+    p.add_argument("--carry_sigma", type=float, default=None,
+                   help="with --carry: noise level of the carried start (default: the student's; give it with an engine)")
     p.add_argument("--videos", action="store_true", help="also write input | plain | filtered per clip and prompt")
     p.add_argument("--table", nargs="+", metavar="JSON", help="print a table of earlier results and exit")
     a = p.parse_args()

@@ -28,6 +28,13 @@ averaged over sigma 8 px) of the decoded crop and of the teacher crop. The teach
 places on consecutive frames, so a student pulled towards both the teacher and temporal consistency averages it
 away; this term asks for the teacher's amount of texture without asking for its placement.
 
+--w_carry > 0 trains the student for the carry-over of `vibe_stream.carry` as well: the student's own 2-step output
+for frame t of each pair (no gradient) is warped to a frame u up to --carry_gap frames later exactly as at run time
+(DIS flow at 320 px, photometric weight pooled to the latent grid, the frame itself where the flow fails), and the
+last step runs from it. That output gets the Huber and LPIPS terms against the teacher's frame u and lam times an L1
+against the warped output, weighted by the flow's weight. With probability --carry_rollout the carried output is
+itself carried once (through a frame between t and u), as in the steady state of the stream.
+
 Recipe of the released 2-step student (runs/lam4_2step): --student_steps 2 --lam 4 --grad_ckpt, 1500 steps,
 about 8 GB and 2 s/step (56 min) on an RTX 3090 Ti. One step: drop --grad_ckpt (16.5 GB, 1.0 s/step).
 
@@ -48,8 +55,9 @@ from torch.utils.checkpoint import checkpoint
 
 import _paths  # noqa: F401
 from vibe_stream import lora
+from vibe_stream.carry import Carry, holds
 from vibe_stream.temporal_loss import masked_warp_l1, occlusion_mask, warp
-from vibe_stream.vibe_model import VibeModel
+from vibe_stream.vibe_model import VibeModel, flow_step
 
 
 def main():
@@ -74,6 +82,12 @@ def main():
     p.add_argument("--w_eq", type=float, default=0.0, help="weight of the shift-equivariance term (0: off)")
     p.add_argument("--eq_shift", type=float, default=16.0, help="largest synthetic shift in pixels")
     p.add_argument("--w_tex", type=float, default=0.0, help="weight of the texture-amount term (0: off)")
+    p.add_argument("--w_carry", type=float, default=0.0, help="weight of the carry-over terms (0: off; 2-step students)")
+    p.add_argument("--carry_gap", type=int, default=8, help="largest distance in frames from the carried output")
+    p.add_argument("--carry_rollout", type=float, default=0.5,
+                   help="probability that the carried output is itself a carried one (one intermediate frame)")
+    p.add_argument("--carry_sigma", type=float, default=None,
+                   help="noise level the carried step starts from (default: the last step's, 0.7496 for 2 steps)")
     p.add_argument("--init", default=None, help="start the student from this LoRA file (same rank and noise)")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--log_every", type=int, default=50)
@@ -116,7 +130,29 @@ def main():
     lat_n, cl, S, mg = size // 32, a.crop // 32, a.crop, a.margin
     log = open(run / "log.jsonl", "w", encoding="utf-8")
     acc = dict.fromkeys(("huber", "lpips", "temp", "temp_teacher") + (("dmd", "dmd_g", "fake") if a.w_dmd > 0 else ())
-                        + (("eq",) if a.w_eq > 0 else ()) + (("tex",) if a.w_tex > 0 else ()), 0.0)
+                        + (("eq",) if a.w_eq > 0 else ()) + (("tex",) if a.w_tex > 0 else ())
+                        + (("c_huber", "c_lpips", "c_temp") if a.w_carry > 0 else ()), 0.0)
+    if a.w_carry > 0 and a.student_steps != 2:
+        raise SystemExit("--w_carry needs --student_steps 2")
+    dis = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_FAST)
+    xs_g, ys_g = np.meshgrid(np.arange(size, dtype=np.float32), np.arange(size, dtype=np.float32))
+
+    def carry_start(prev_out, prev_in, cur_in, tau=12.0):
+        """Host side as in vibe_stream.carry: the previous output warped to the current frame, and the weight."""
+        fl = Carry.flow_to(cur_in, prev_in, dis, 320)
+        guess = cv2.remap(prev_out, xs_g + fl[..., 0], ys_g + fl[..., 1], cv2.INTER_LINEAR,
+                          borderMode=cv2.BORDER_REPLICATE)
+        return guess, holds(cur_in, prev_in, fl, tau).astype(np.float32)
+
+    def carry_step(guesses, weights, img_lat_c, emb_c):
+        """The last student step from (1 - s1) (w enc(guess) + (1 - w) enc(frame)) + s1 noise (DC-AE latents)."""
+        ts2, sg2 = m.schedules[2]
+        s, t = (sg2[1], ts2[1]) if a.carry_sigma is None else (a.carry_sigma, torch.tensor(1000.0 * a.carry_sigma, device=dev))
+        zg = m.encode(guesses).clone()
+        wl = F.adaptive_avg_pool2d(torch.from_numpy(np.stack(weights))[:, None].to(dev), lat_n)
+        x = (1 - s) * (wl * zg + (1 - wl) * img_lat_c) + s * m.noise
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            return flow_step(x, m.velocity(x, img_lat_c, emb_c, t), s, 0.0)
 
     def gblur(x, sigma):
         r = int(3 * sigma + 0.5)
@@ -216,6 +252,44 @@ def main():
             l_tex = (texture_amount(out01) - texture_amount(t01)).abs()[inner].mean()
             loss = loss + a.w_tex * l_tex
             terms.append(("tex", l_tex))
+        if a.w_carry > 0:
+            # source: the student's own 2-step output for frame t of each pair; target: a frame 1..carry_gap later,
+            # optionally through one intermediate carried frame (as in the steady state of the stream)
+            with torch.no_grad():
+                src = m.decode_u8(x0[0::2].detach())
+            chains = []
+            for (d, k, t) in items:
+                u = t + random.randint(1, min(a.carry_gap, nfr - 1 - t))
+                mid = random.randrange(t + 1, u) if u - t >= 2 and random.random() < a.carry_rollout else None
+                chains.append((d, k, t, mid, u))
+            hop = [(i, c) for i, c in enumerate(chains) if c[3] is not None]
+            if hop:
+                with torch.no_grad():
+                    st = [carry_start(src[i], c[0]["frames"][c[2]], c[0]["frames"][c[3]]) for i, c in hop]
+                    il_m = torch.from_numpy(np.stack([c[0]["img_lat"][c[3]] for _, c in hop])).to(dev)
+                    out_m = m.decode_u8(carry_step([g for g, _ in st], [w for _, w in st], il_m,
+                                                   torch.stack([emb[2 * i] for i, _ in hop])))
+                src = list(src)
+                for (i, _), o in zip(hop, out_m):
+                    src[i] = o
+            st = [carry_start(src[i], d["frames"][t if mid is None else mid], d["frames"][u])
+                  for i, (d, k, t, mid, u) in enumerate(chains)]
+            il_c = torch.from_numpy(np.stack([d["img_lat"][u] for d, _, _, _, u in chains])).to(dev)
+            x0c = carry_step([g for g, _ in st], [w for _, w in st], il_c, emb[0::2])
+            tlat_c = torch.from_numpy(np.stack([d[f"tlat_{k}"][u] for d, k, _, _, u in chains])).to(dev)
+            timg_c = torch.from_numpy(np.stack([d[f"timg_{k}"][u, Y:Y + S, X:X + S] for d, k, _, _, u in chains]))
+            timg_c = timg_c.to(dev).permute(0, 3, 1, 2).float() / 127.5 - 1
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                l_clat = F.smooth_l1_loss(x0c, tlat_c, beta=0.1)
+                dec_c = decode_crop(x0c, cy, cx)
+            l_clp = lp(dec_c[inner].clamp(-1, 1), timg_c[inner]).mean()
+            # agreement with the carried output where the flow holds (its own temporal term)
+            g01 = torch.from_numpy(np.stack([g[Y:Y + S, X:X + S] for g, _ in st])).to(dev).permute(0, 3, 1, 2).float() / 255
+            wc = torch.from_numpy(np.stack([w[Y:Y + S, X:X + S] for _, w in st])).to(dev)[:, None]
+            err = ((dec_c.clamp(-1, 1) + 1) / 2 - g01).abs().mean(1, keepdim=True)[inner]
+            l_ct = (err * wc[inner]).sum() / wc[inner].sum().clamp_min(1.0)
+            loss = loss + a.w_carry * (l_clat + a.w_lp * l_clp + a.lam * l_ct)
+            terms += [("c_huber", l_clat), ("c_lpips", l_clp), ("c_temp", l_ct)]
         if a.w_dmd > 0:
             l_dmd, g_abs = dmd_term(x0, img_lat, emb)
             loss = loss + a.w_dmd * l_dmd
@@ -235,6 +309,8 @@ def main():
             dmd = f"dmd {r['dmd']:.4f} |g| {r['dmd_g']:.3f} fake {r['fake']:.4f}  " if a.w_dmd > 0 else ""
             dmd += f"eq {r['eq'] * 255:.2f}  " if a.w_eq > 0 else ""
             dmd += f"tex {r['tex'] * 255:.2f}  " if a.w_tex > 0 else ""
+            dmd += (f"carry huber {r['c_huber']:.4f} lpips {r['c_lpips']:.4f} temp {r['c_temp'] * 255:.2f}  "
+                    if a.w_carry > 0 else "")
             print(f"[train] {step + 1:5d}/{a.steps} huber {r['huber']:.4f} lpips {r['lpips']:.4f} "
                   f"temp {r['temp'] * 255:.2f} (teacher {r['temp_teacher'] * 255:.2f}, /255)  {dmd}{el / (step + 1):.2f} s/step  "
                   f"peak {torch.cuda.max_memory_allocated() / 2**30:.1f} GB", flush=True)
@@ -249,7 +325,8 @@ def main():
                                                      student_steps=a.student_steps, w_lp=a.w_lp, steps=a.steps,
                                                      prompts=prompts, teacher_steps=meta["teacher_steps"],
                                                      w_dmd=a.w_dmd, w_eq=a.w_eq, eq_shift=a.eq_shift,
-                                                     w_tex=a.w_tex, init=a.init))
+                                                     w_tex=a.w_tex, w_carry=a.w_carry,
+                                                     carry_sigma=a.carry_sigma if a.w_carry > 0 else None, init=a.init))
     print(f"[train] saved {run / 'lora.safetensors'} after {time.perf_counter() - t0:.0f} s", flush=True)
 
 
