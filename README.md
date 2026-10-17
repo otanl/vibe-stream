@@ -16,12 +16,19 @@ and the same edit strength ("Flicker"). The numbers below say what has been meas
 
 ## Demo
 
-https://github.com/user-attachments/assets/26081288-3447-4734-902b-ddc4dcb9c8a9
+https://github.com/user-attachments/assets/1e6c7754-9cb5-41bc-add8-d00b65fecdfd
 
 Input | oil painting | anime on five DAVIS-2017 clips through the real-time path at 640 px on an RTX 3090 Ti: the
-2-step student, taesana, and the transformer as a TensorRT engine (`scripts/make_demo.py`). Each output panel shows
-the loop fps of its run: 27-29 fps on these short clips, 29.1 fps on the 480-frame loop in the speed table. Input
-clips: [DAVIS-2017](https://davischallenge.org/), see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+student trained for the carry-over (`lam4_carry_s05_2step_640`) with the transformer as a TensorRT engine, taesana,
+the carry-over and the temporal filter 0.7 / 0.3 (`scripts/make_demo.py --carry --temporal_filter 0.7 0.3`; see
+"Flicker"). Each output panel shows the loop fps of its run: 43-44 fps on these short clips, 44.1 fps on the
+480-frame loop (Speed).
+
+The same clips on the plain 2-step path (the released student, about twice the flicker; 27-29 fps):
+
+https://github.com/user-attachments/assets/26081288-3447-4734-902b-ddc4dcb9c8a9
+
+Input clips: [DAVIS-2017](https://davischallenge.org/), see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## How it works
 
