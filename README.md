@@ -13,7 +13,8 @@ DreamLite-mobile's: styles are about equal and instruction edits are clearly bet
 streaming loop runs at 21.0 fps at 768 and 29.1 fps at 640 on an RTX 3090 Ti. A student trained to carry the
 previous output over into the next batch (one transformer call per frame) runs at 47.8 fps at 640 with less flicker
 and about the same edit strength; with the display filter on top, the flicker is half the 2-step path's at 44.1 fps
-at 640 and 31.1 fps at 768 ("Flicker"). The numbers below say what has been measured and how.
+at 640 and 31.1 fps at 768 ("Flicker"). One trained with a colour-mapped fill also keeps the 2-step path's colours,
+at the same speed at 768 and a few percent slower at 640. The numbers below say what has been measured and how.
 
 ## Demo
 
@@ -125,7 +126,10 @@ the student's `carry_sigma` 0.5 into the spec, which `StreamEditor` reads) runs 
 44.1 fps (2 steps, carry-over, carry-over + filter). Its output differs from PyTorch bf16 by 0.81 in mean absolute
 value on the carried step (`blackswan`, oil, 40 frames) and by 1.16 on the 2-step path. At 768 the engine of
 `lam4_carry_s05_2step_768` (velocity within 1.3-1.9 % of bf16 PyTorch, 21.3 ms per frame per step) runs it at 20.1,
-32.4 and 31.1 fps.
+32.4 and 31.1 fps, and that of `lam4_carry_s05_lut_2step_768` (colour-mapped fill) at 20.7, 32.4 and 31.1. At 640
+the engine of `lam4_carry_s05_lut_2step_640`, timed alternately with that of `lam4_carry_s05_2step_640` (two rounds
+each; the machine was busier than for the numbers above, and the latter ran 28.6, 43.2 and 41.2), runs at 27.8, 41.3
+and 39.0: 3-5 % slower, of which 3 % already on the 2-step path, where the fill plays no part.
 
 ### Flicker (streaming path)
 
@@ -279,8 +283,8 @@ Against VIBE's 640 px 8-step output (`eval_student.py --size 640`, DC-AE path, a
   111, where `lam4_carry_s05` had 123); nothing drifts. `lam4_carry_s05_lut` with the filter is the best setting
   found.
 
-**At 768.** The released 768 student `lam4_2step` and `lam4_carry_s05_2step_768`, trained as `lam4_carry_s05` at 640
-(84 min at 3.3 s/step):
+**At 768.** The released 768 student `lam4_2step`, and `lam4_carry_s05_2step_768` and `lam4_carry_s05_lut_2step_768`
+trained as `lam4_carry_s05` and `lam4_carry_s05_lut` at 640 (84 and 90 min at 3.3 and 3.6 s/step):
 
 | Student | Path / display | Valid oil / anime | Low / high (oil) | Warp oil | Sobel oil | CLIP dir oil / anime |
 |---|---|---:|---:|---:|---:|---:|
@@ -288,6 +292,8 @@ Against VIBE's 640 px 8-step output (`eval_student.py --size 640`, DC-AE path, a
 | | filter 0.7 / 0.3 | 14.5 / 6.9 | 7.7 / 10.5 | 17.0 | 11.1 | 0.219 / 0.175 |
 | `lam4_carry_s05_2step_768` | carry-over from sigma 0.5 | 14.9 / 7.8 | 7.0 / 11.6 | 17.7 | 11.9 | 0.214 / 0.187 |
 | | carry-over from sigma 0.5 + filter 0.7 / 0.3 | 10.8 / 5.6 | 4.6 / 8.9 | 13.9 | 10.1 | 0.205 / 0.183 |
+| `lam4_carry_s05_lut_2step_768` | carry-over from sigma 0.5, colour-mapped fill | 13.9 / 6.7 | 6.6 / 10.8 | 16.7 | 11.0 | 0.216 / 0.184 |
+| | the same + filter 0.7 / 0.3 | **10.1 / 4.9** | 4.3 / 8.2 | 13.1 | 9.3 | **0.206 / 0.179** |
 
 - The carry-over does at 768 what it does at 640: with the filter it halves the flicker (21.4 / 10.3 to 10.8 / 5.6)
   and the loop runs at 31.1 fps instead of 20.1 (Speed). Oil pays more edit strength than at 640: the 2-step path's
@@ -296,6 +302,12 @@ Against VIBE's 640 px 8-step output (`eval_student.py --size 640`, DC-AE path, a
 - The long-run check behaves as at 640: plateau after 80 frames, oil Sobel equal to the 2-step path's throughout. The
   anime colour difference is larger. The 768 2-step path paints `goat` paler than the 640 one (HSV saturation 17-21
   against 36), the carry-over output keeps 47-50, and its distance to the 2-step output settles at 38-41 (640: 23-27).
+- The colour-mapped fill works as at 640 (`lam4_carry_s05_lut_2step_768`): low-band colour distance 13.5 to 8.9,
+  saturation excess +4.8 to +1.1. In the long-run check `goat` anime settles at 13 from the 2-step output instead of
+  38-41, with the 2-step path's pale colours (saturation 14-18 against 15-19), and `blackswan` anime at 17 instead
+  of 35-37. Flicker goes down a little (with the filter 10.1 / 4.9), edit strength stays (CLIP 0.206 / 0.179 with
+  the filter), texture goes down a little (Sobel 10.1 to 9.3 with the filter), and the loop speed is unchanged
+  (Speed).
 
 ## Setup
 
@@ -342,7 +354,7 @@ python scripts/make_teacher_data.py --out data/teacher_640 --size 640
 python scripts/train_student.py --data data/teacher_640 --run runs/lam4_2step_640 --student_steps 2 --lam 4 --grad_ckpt
 python scripts/eval_student.py --size 640 --out out/eval_640 --runs runs/lam4_2step_640
 # ... trained for the carry-over as well, carried step from sigma 0.5 with the colour-mapped fill (~76 min at
-# 3.0 s/step; at 768 with data/teacher_768, ~84 min)
+# 3.0 s/step; at 768 with data/teacher_768, ~90 min)
 python scripts/train_student.py --data data/teacher_640 --run runs/lam4_carry_s05_lut_2step_640 --student_steps 2 \
     --lam 4 --w_carry 1 --carry_sigma 0.5 --carry_fill lut --grad_ckpt
 python scripts/eval_flicker.py --student runs/lam4_carry_s05_lut_2step_640/lora.safetensors --carry \
