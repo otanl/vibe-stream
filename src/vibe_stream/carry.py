@@ -17,6 +17,15 @@ Keyframes run the usual k steps from noise: the first batch of a clip, every `ke
 any batch with a frame that the flow explains on less than `cut_below` of its area on average (a cut). On the DAVIS
 clips that mean is 0.03-0.29 (median 0.11) across cuts and 0.24 or more (median 0.42) within a clip 8 frames apart.
 
+The frame that fills in where the flow fails can carry the style's colours instead of the source's (`fill="lut"`):
+the keyframe batch's inputs and outputs give a colour map (`fit_colour_map`: mean output colour per input colour,
+both blurred, on a 16-level RGB grid, smoothed), and the fill is the frame with its local colour moved through that map
+(`apply_colour_map`). With the plain frame, about half of every carried start is the source (w is near 0.5 even where
+the flow is right), and the single step does not repaint large colour changes: anime keeps a green pond that the
+2-step path paints pale blue. A student is trained for one fill (`train_student.py --carry_fill`); it records it.
+Swapping the fill at run time fixes saturation but not colour; a student trained with the map brings the carried
+output's low-band colour a third closer to the 2-step path's (README, Flicker).
+
 `plan` runs on the host when a batch is staged (flows into pinned memory, copied without a sync); `start` and
 `update` run on the GPU stream in order with the batch's edit.
 """
@@ -42,11 +51,64 @@ def holds(cur: np.ndarray, ref: np.ndarray, flow: np.ndarray, tau: float) -> np.
     return np.exp(-(d.mean(2) if d.ndim == 3 else d) / tau)
 
 
+def _gblur(x: torch.Tensor, sigma: float) -> torch.Tensor:
+    """(B, C, H, W) float, separable Gaussian, replicated border."""
+    r = max(1, int(3 * sigma))
+    k = torch.exp(-(torch.arange(-r, r + 1, device=x.device, dtype=torch.float32) ** 2) / (2 * sigma ** 2))
+    k = (k / k.sum()).view(1, 1, 1, -1).expand(x.shape[1], 1, 1, -1)
+    x = F.conv2d(F.pad(x, (r, r, 0, 0), mode="replicate"), k, groups=x.shape[1])
+    return F.conv2d(F.pad(x, (0, 0, r, r), mode="replicate"), k.transpose(2, 3), groups=x.shape[1])
+
+
+def _blur_grid(v: torch.Tensor, sigma: float) -> torch.Tensor:
+    """(C, D, D, D) float, Gaussian of `sigma` cells along each axis, zero border."""
+    r = max(1, int(2 * sigma))
+    k = torch.exp(-(torch.arange(-r, r + 1, device=v.device, dtype=torch.float32) ** 2) / (2 * sigma ** 2))
+    k = k / k.sum()
+    x = v.unsqueeze(1)
+    for axis in range(3):
+        shape = [1, 1, 1]
+        shape[axis] = -1
+        pad = [0, 0, 0]
+        pad[axis] = r
+        x = F.conv3d(x, k.view(1, 1, *shape), padding=pad)
+    return x.squeeze(1)
+
+
+def fit_colour_map(inputs: torch.Tensor, outputs: torch.Tensor, bins: int = 16, sigma_px: float = 4.0,
+                   sigma_bin: float = 1.0, prior: float = 50.0) -> torch.Tensor:
+    """Colour offsets (3, bins, bins, bins), indexed [R][G][B] by input colour: the mean of blur(output) -
+    blur(input) over the pixels of that colour (every 4th pixel), smoothed over neighbouring colours and pulled towards
+    the overall mean offset where a colour is rare (`prior` pixels' worth). inputs / outputs (B, H, W, 3) uint8."""
+    a = _gblur(inputs.permute(0, 3, 1, 2).float(), sigma_px)[:, :, ::4, ::4]
+    b = _gblur(outputs.permute(0, 3, 1, 2).float(), sigma_px)[:, :, ::4, ::4]
+    idx = (a * (bins / 256)).long().clamp(0, bins - 1)
+    flat = ((idx[:, 0] * bins + idx[:, 1]) * bins + idx[:, 2]).reshape(-1)
+    d = (b - a).permute(1, 0, 2, 3).reshape(3, -1)
+    sums = torch.zeros(3, bins ** 3, device=a.device).index_add_(1, flat, d)
+    cnt = torch.zeros(1, bins ** 3, device=a.device).index_add_(1, flat, torch.ones(1, flat.numel(), device=a.device))
+    sums = _blur_grid(sums.view(3, bins, bins, bins), sigma_bin)
+    cnt = _blur_grid(cnt.view(1, bins, bins, bins), sigma_bin)
+    return (sums + prior * d.mean(1).view(3, 1, 1, 1)) / (cnt + prior)
+
+
+def apply_colour_map(cmap: torch.Tensor, frames: torch.Tensor, sigma_px: float = 4.0) -> torch.Tensor:
+    """frames (B, H, W, 3) uint8 with the offset of their local (blurred) colour added, trilinear in the map."""
+    x = frames.permute(0, 3, 1, 2).float()
+    grid = (_gblur(x, sigma_px) * (2 / 256) - 1).permute(0, 2, 3, 1)[..., [2, 1, 0]].unsqueeze(1)
+    off = F.grid_sample(cmap.unsqueeze(0).expand(len(frames), -1, -1, -1, -1), grid, mode="bilinear",
+                        padding_mode="border", align_corners=False)[:, :, 0]
+    return (x + off).clamp(0, 255).round().to(torch.uint8).permute(0, 2, 3, 1).contiguous()
+
+
 class Carry:
     def __init__(self, keyframe_every: int = 0, tau: float = 12.0, cut_below: float = 0.2, flow_size: int = 320,
-                 sigma: Optional[float] = None, device: str = "cuda"):
+                 sigma: Optional[float] = None, fill: Optional[str] = None, device: str = "cuda"):
         self.keyframe_every, self.tau, self.cut_below, self.flow_size = keyframe_every, tau, cut_below, flow_size
         self.sigma = sigma        # noise level of the carried start; None: the student's (or its last step's)
+        if fill not in (None, "frame", "lut"):
+            raise ValueError(f"fill must be 'frame' or 'lut', not {fill!r}")
+        self.fill = fill          # what fills in where the flow fails; None: the student's (or the frame)
         self.device = device
         self.dis = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_FAST)
         self._pinned: List[torch.Tensor] = []
@@ -60,6 +122,8 @@ class Carry:
         self._ref_gray: Optional[np.ndarray] = None
         self._ref_in = self._ref_out = None
         self._since_key = 0
+        self._was_key = False
+        self._cmap: Optional[torch.Tensor] = None
 
     @staticmethod
     def flow_to(cur: np.ndarray, ref: np.ndarray, dis, size: int) -> np.ndarray:
@@ -87,6 +151,7 @@ class Carry:
                 if holds(g, ref, buf[j], self.tau).mean() < self.cut_below:
                     key = True
                     break
+        self._was_key = key
         if key:
             self._since_key = 1
             self.keyframes += 1
@@ -97,9 +162,10 @@ class Carry:
         return out
 
     @torch.inference_mode()
-    def start(self, inputs: torch.Tensor, flows: torch.Tensor, lat_size: int):
-        """GPU side: (warped previous output (B, H, W, 3) uint8, w (B, 1, lat_size, lat_size)) for the batch's inputs
-        (B, H, W, 3) uint8 and the flows from `plan`."""
+    def start(self, inputs: torch.Tensor, flows: torch.Tensor, lat_size: int, fill: str = "frame"):
+        """GPU side: (warped previous output (B, H, W, 3) uint8, w (B, 1, lat_size, lat_size), fill) for the batch's
+        inputs (B, H, W, 3) uint8 and the flows from `plan`; fill is None for the frame itself, else the frames through
+        the keyframe's colour map (B, H, W, 3) uint8."""
         h, w = inputs.shape[1:3]
         fl = F.interpolate(flows.permute(0, 3, 1, 2), size=(h, w), mode="bilinear", align_corners=False) * (h / self.flow_size)
         fl = fl.permute(0, 2, 3, 1)
@@ -108,10 +174,14 @@ class Carry:
         wi, _ = warp(self._ref_in.expand(n, -1, -1, -1), fl)
         m = torch.exp(-(inputs.permute(0, 3, 1, 2).float() - wi).abs().mean(1, keepdim=True) / self.tau)
         guess = guess.clamp(0, 255).round().to(torch.uint8).permute(0, 2, 3, 1).contiguous()
-        return guess, F.adaptive_avg_pool2d(m, lat_size)
+        lut = apply_colour_map(self._cmap, inputs) if fill == "lut" and self._cmap is not None else None
+        return guess, F.adaptive_avg_pool2d(m, lat_size), lut
 
     @torch.inference_mode()
-    def update(self, inputs: torch.Tensor, outputs: torch.Tensor) -> None:
-        """Keep the batch's last input and output (before any display filter) as the next reference."""
+    def update(self, inputs: torch.Tensor, outputs: torch.Tensor, fill: str = "frame") -> None:
+        """Keep the batch's last input and output (before any display filter) as the next reference; after a keyframe
+        batch with fill "lut", also its colour map."""
         self._ref_in = inputs[-1:].permute(0, 3, 1, 2).float()
         self._ref_out = outputs[-1:].permute(0, 3, 1, 2).float()
+        if fill == "lut" and self._was_key:
+            self._cmap = fit_colour_map(inputs, outputs)

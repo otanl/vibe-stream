@@ -7,8 +7,8 @@ Stage 2, `build`: TensorRT only, from those files, in a fresh process (building 
 has overflowed 24 GB).
 
 An engine is fixed to one resolution, one batch size and one TensorRT version. `<engine>.json` (`EngineSpec`)
-records them together with the student it was built from (and the student's `carry_sigma`, read by `StreamEditor`),
-and `TRTTransformer` refuses a mismatch. The student's init noise is stored next to the engine
+records them together with the student it was built from (and the student's `carry_sigma` and `carry_fill`, read by
+`StreamEditor`), and `TRTTransformer` refuses a mismatch. The student's init noise is stored next to the engine
 (`<engine>.noise.safetensors`), so the engine alone is enough to run.
 
 Measured on an RTX 3090 Ti with TensorRT 10.16 at 768, batch 8: 2.98 GB engine built in 100 s, velocity within
@@ -46,6 +46,7 @@ class EngineSpec:
     sigmas: List[float]
     prompts: dict
     carry_sigma: Optional[float] = None   # the student's trained start of the carried step (vibe_stream.carry)
+    carry_fill: Optional[str] = None      # and what it was trained to fill in with where the flow fails
 
     @staticmethod
     def path_for(engine) -> Path:
@@ -145,7 +146,8 @@ def export(model: VibeModel, student, engine, batch: int, img_lat: torch.Tensor,
     # the TensorRT version and platform are filled in by `build`
     EngineSpec(tensorrt="", platform="", size=model.size, batch=batch, student=str(student),
                student_sha256=sha256(student), student_steps=k, timesteps=[float(t[0]) for t in tsc], sigmas=sg,
-               prompts=meta.get("prompts", {}), carry_sigma=meta.get("carry_sigma")).save(engine)
+               prompts=meta.get("prompts", {}), carry_sigma=meta.get("carry_sigma"),
+               carry_fill=meta.get("carry_fill")).save(engine)
     onnx = onnx_path(engine)
     onnx.parent.mkdir(parents=True, exist_ok=True)
     t0 = time.perf_counter()

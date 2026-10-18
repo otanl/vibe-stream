@@ -12,7 +12,8 @@ DreamLite-mobile's: styles are about equal and instruction edits are clearly bet
 **Status: research code.** Two students are trained (2 steps, two style prompts, at 768 and at 640 px); the whole
 streaming loop runs at 21.0 fps at 768 and 29.1 fps at 640 on an RTX 3090 Ti. A student trained to carry the
 previous output over into the next batch (one transformer call per frame) runs at 47.8 fps at 640 with less flicker
-and the same edit strength ("Flicker"). The numbers below say what has been measured and how.
+and about the same edit strength; with the display filter on top, the flicker is half the 2-step path's at 44.1 fps
+at 640 and 31.1 fps at 768 ("Flicker"). The numbers below say what has been measured and how.
 
 ## Demo
 
@@ -122,16 +123,18 @@ The filter's optical flow runs on the host behind the GPU; its blend costs about
 carry-over's flows are hidden the same way. The engine of `lam4_carry_s05_2step_640` (Flicker; `build_trt.py` copies
 the student's `carry_sigma` 0.5 into the spec, which `StreamEditor` reads) runs the same loop at 29.6, 47.8 and
 44.1 fps (2 steps, carry-over, carry-over + filter). Its output differs from PyTorch bf16 by 0.81 in mean absolute
-value on the carried step (`blackswan`, oil, 40 frames) and by 1.16 on the 2-step path.
+value on the carried step (`blackswan`, oil, 40 frames) and by 1.16 on the 2-step path. At 768 the engine of
+`lam4_carry_s05_2step_768` (velocity within 1.3-1.9 % of bf16 PyTorch, 21.3 ms per frame per step) runs it at 20.1,
+32.4 and 31.1 fps.
 
-### Flicker (640, streaming path)
+### Flicker (streaming path)
 
 `scripts/eval_flicker.py`: DAVIS `blackswan`, `parkour`, `dance-twirl`, `camel`, `goat` and `libby`, first 40 frames,
-prompts `oil` and `anime`, through the streaming editor with taesana (PyTorch bf16). *Valid* is the frame-to-frame
-change of the output after warping by the input's flow, counted only where the same warp reproduces the input
-(`metrics.flicker`; the input itself scores about 2.5): what remains is change the edit added. *Low* / *high* split
-it at a Gaussian of sigma 4 px. DreamLite-mobile's lean path scores about 12 for both prompts on the same clips
-(measured on dreamlite-stream's 768 demo).
+prompts `oil` and `anime`, through the streaming editor with taesana (PyTorch bf16), at 640 except for the last table
+of the section. *Valid* is the frame-to-frame change of the output after warping by the input's flow, counted only
+where the same warp reproduces the input (`metrics.flicker`; the input itself scores about 2.5): what remains is
+change the edit added. *Low* / *high* split it at a Gaussian of sigma 4 px. DreamLite-mobile's lean path scores
+about 12 for both prompts on the same clips (measured on dreamlite-stream's 768 demo).
 
 **Where it comes from.** Every frame starts from the same init noise, and the transformer works on 32-pixel latent
 tokens, so the student's texture is anchored to the screen: content that moves by a few pixels gets repainted
@@ -171,7 +174,9 @@ frame. `lam4_carry` is trained for it (`--w_carry 1`): the student's own output,
 as at run time (and with probability 0.5 carried once more through a frame in between), is the start of a step that
 gets the Huber and LPIPS terms against the teacher and lam times an L1 against the warped output; the usual pair
 terms stay, so its 2-step path still serves keyframes. Keyframes come at the start and at cuts (detected from the
-flow, `Carry.cut_below`); the runs below have no other keyframes.
+flow, `Carry.cut_below`); the runs below have no other keyframes. With `--carry_fill lut` what fills in where the
+flow does not hold is the frame passed through a colour map fitted at the keyframe instead of the frame itself (last
+point below).
 
 *Plain* is the 2-step path without the filter.
 
@@ -198,6 +203,8 @@ flow, `Carry.cut_below`); the runs below have no other keyframes.
 | | carry-over from sigma 0.35 + filter 0.7 / 0.3 | 9.5 / 5.4 | 4.1 / 7.8 | 12.0 | 9.7 | 0.201 / 0.175 |
 | `lam4_carry_s05_cl8_2step_640` | carry-over from sigma 0.5 | 13.6 / 7.8 | 6.7 / 10.3 | 15.6 | 10.9 | 0.205 / 0.178 |
 | | carry-over from sigma 0.5 + filter 0.7 / 0.3 | 9.6 / 5.4 | 4.2 / 7.8 | 11.9 | 9.2 | 0.201 / 0.174 |
+| `lam4_carry_s05_lut_2step_640` | carry-over from sigma 0.5, colour-mapped fill | 13.8 / 7.5 | 6.5 / 10.7 | 15.8 | 11.3 | 0.210 / 0.179 |
+| | the same + filter 0.7 / 0.3 | **9.8 / 5.3** | 4.1 / 8.1 | 12.2 | 9.6 | **0.207 / 0.174** |
 
 Against VIBE's 640 px 8-step output (`eval_student.py --size 640`, DC-AE path, as in the 640 table above):
 
@@ -241,11 +248,11 @@ Against VIBE's 640 px 8-step output (`eval_student.py --size 640`, DC-AE path, a
   are still largely repainted (high band 11.2). With the filter it reaches 10.2 / 5.7 at CLIP 0.205 / 0.175, where
   eq4 with the filter has 10.0 / 6.0 at 0.192 / 0.165. The long-run check behaves as at sigma 0.75 (plateau after
   80 frames, nothing degrades). In anime, `blackswan`'s pond is green (the source's colour) by frame 40 and stays
-  so, where the 2-step path paints it pale blue. This is not the frame being mixed in where the flow fails: the
-  flow check passes as much of the pond as of the rest of the picture (mean w 0.55 in the lower half of the frame,
-  0.53 overall), and a looser check (`eval_flicker.py --carry_tau 24`, 48, against 12) leaves the pond green while
-  costing edit strength (CLIP 0.208 / 0.175 and 0.201 / 0.170) without changing flicker (14.6 / 8.0, 14.8 / 7.9);
-  at 48 the moving figure in `parkour` leaves ghosts.
+  so, where the 2-step path paints it pale blue. This is not the flow failing on the pond: the flow check passes as
+  much of the pond as of the rest of the picture (mean w 0.55 in the lower half of the frame, 0.53 overall), and a
+  looser check (`eval_flicker.py --carry_tau 24`, 48, against 12) leaves the pond green while costing edit strength
+  (CLIP 0.208 / 0.175 and 0.201 / 0.170) without changing flicker (14.6 / 8.0, 14.8 / 7.9); at 48 the moving figure
+  in `parkour` leaves ghosts. The colour comes in through the mix itself (last point).
 - Lower still (`--carry_sigma 0.35`) the gain halves: 13.4 / 7.7, with Sobel 11.9 to 11.4 and CLIP oil 0.209 to
   0.205 (anime 0.180). Texture goes at about the rate the filter spends it, oil edit strength faster, so the sigma
   series has levelled off at 0.5. The long-run check behaves as before.
@@ -255,7 +262,40 @@ Against VIBE's 640 px 8-step output (`eval_student.py --size 640`, DC-AE path, a
   (on `lam4_carry_s05` the filter takes 4.2 off the flicker for 1.9 of Sobel; the weight takes 0.9 for 1.0). In the
   long-run check its carry-over output on `blackswan` oil has less texture than the 2-step path (Sobel 9.4-9.9
   against 10.8-11.7, where `lam4_carry_s05` matched it), visibly smoother water; it does not drift either.
-  `lam4_carry_s05` with the filter remains the best setting found.
+- The source's colour comes in through the mix. With w about 0.5 everywhere, half of every carried start is the
+  frame's own latent, and one step from sigma 0.5 does not repaint large colour areas: where the 2-step path
+  recolours (the pond, `goat`'s hillside in anime), the carried output moves towards the source over the first
+  batches and then carries that colour on. `Carry(fill="lut")` (`--carry_fill lut`) fills with the frame passed
+  through a colour map instead: fitted on each keyframe batch, for each input colour (16³ bins, frames blurred by
+  4 px) the mean change the 2-step path made to it, shrunk towards the overall change where a colour is rare.
+  Applied at run time to `lam4_carry_s05` it fixes the saturation but not the colour: the low-band distance to the
+  2-step output of the same frames (blur 16 px, six clips, after the keyframe batch) goes from 12.5 to 12.9, and oil
+  is oversaturated (`libby` 138 against the 2-step path's 124). Trained with it (`lam4_carry_s05_lut`; the map is
+  fitted on the student's own 2-step output of the chain's first frame) it works: distance 8.5, `blackswan` anime
+  27 to 12 (the pond pale green instead of green), saturation within 2 of the 2-step path's, and slightly less
+  flicker (13.8 / 7.5, with the filter 9.8 / 5.3) at the same edit strength (CLIP 0.210 / 0.179), for some texture
+  (Sobel 11.9 to 11.3). In the long-run check `blackswan` anime settles at 19-20 from the 2-step output instead of
+  36-37, `goat` anime at 14 instead of 23-27, and in oil the saturation now matches the 2-step path's (113 against
+  111, where `lam4_carry_s05` had 123); nothing drifts. `lam4_carry_s05_lut` with the filter is the best setting
+  found.
+
+**At 768.** The released 768 student `lam4_2step` and `lam4_carry_s05_2step_768`, trained as `lam4_carry_s05` at 640
+(84 min at 3.3 s/step):
+
+| Student | Path / display | Valid oil / anime | Low / high (oil) | Warp oil | Sobel oil | CLIP dir oil / anime |
+|---|---|---:|---:|---:|---:|---:|
+| `lam4_2step` (released) | plain | 21.4 / 10.3 | 13.1 / 13.8 | 23.4 | 13.0 | 0.232 / 0.181 |
+| | filter 0.7 / 0.3 | 14.5 / 6.9 | 7.7 / 10.5 | 17.0 | 11.1 | 0.219 / 0.175 |
+| `lam4_carry_s05_2step_768` | carry-over from sigma 0.5 | 14.9 / 7.8 | 7.0 / 11.6 | 17.7 | 11.9 | 0.214 / 0.187 |
+| | carry-over from sigma 0.5 + filter 0.7 / 0.3 | 10.8 / 5.6 | 4.6 / 8.9 | 13.9 | 10.1 | 0.205 / 0.183 |
+
+- The carry-over does at 768 what it does at 640: with the filter it halves the flicker (21.4 / 10.3 to 10.8 / 5.6)
+  and the loop runs at 31.1 fps instead of 20.1 (Speed). Oil pays more edit strength than at 640: the 2-step path's
+  CLIP 0.232, higher than at 640, comes down to 0.214 with the carry-over and 0.205 with the filter, where the 640
+  rows end too. Anime gains (0.181 to 0.187).
+- The long-run check behaves as at 640: plateau after 80 frames, oil Sobel equal to the 2-step path's throughout. The
+  anime colour difference is larger. The 768 2-step path paints `goat` paler than the 640 one (HSV saturation 17-21
+  against 36), the carry-over output keeps 47-50, and its distance to the 2-step output settles at 38-41 (640: 23-27).
 
 ## Setup
 
@@ -283,7 +323,8 @@ python scripts/stream_video.py --input assets/davis_mp4/blackswan.mp4 --prompt o
 # ... or with PyTorch only
 python scripts/stream_video.py --input ... --student runs/lam4_2step/lora.safetensors
 # ... with the display-side temporal filter and / or the carry-over (any of these scripts, including make_demo.py);
-# a student trained for another start of the carried step (--carry_sigma) records it, and so does its engine
+# a student trained for another start or fill of the carried step (--carry_sigma, --carry_fill) records it, and so
+# does its engine
 python scripts/stream_video.py --input ... --engine ... --temporal_filter 0.7 0.3 --carry
 # Flicker of a student, plain and filtered, and the shift probe; --table compares result files
 python scripts/eval_flicker.py --student runs/lam4_2step_640/lora.safetensors --out out/flicker/lam4_2step_640.json
@@ -300,11 +341,12 @@ python scripts/eval_student.py --out out/eval --runs runs/lam4_2step --base
 python scripts/make_teacher_data.py --out data/teacher_640 --size 640
 python scripts/train_student.py --data data/teacher_640 --run runs/lam4_2step_640 --student_steps 2 --lam 4 --grad_ckpt
 python scripts/eval_student.py --size 640 --out out/eval_640 --runs runs/lam4_2step_640
-# ... trained for the carry-over as well (~71 min at 2.8 s/step)
-python scripts/train_student.py --data data/teacher_640 --run runs/lam4_carry_2step_640 --student_steps 2 --lam 4 \
-    --w_carry 1 --grad_ckpt
-python scripts/eval_flicker.py --student runs/lam4_carry_2step_640/lora.safetensors --carry \
-    --out out/flicker/lam4_carry_2step_640_carry.json
+# ... trained for the carry-over as well, carried step from sigma 0.5 with the colour-mapped fill (~76 min at
+# 3.0 s/step; at 768 with data/teacher_768, ~84 min)
+python scripts/train_student.py --data data/teacher_640 --run runs/lam4_carry_s05_lut_2step_640 --student_steps 2 \
+    --lam 4 --w_carry 1 --carry_sigma 0.5 --carry_fill lut --grad_ckpt
+python scripts/eval_flicker.py --student runs/lam4_carry_s05_lut_2step_640/lora.safetensors --carry \
+    --out out/flicker/lam4_carry_s05_lut_2step_640_carry.json
 ```
 
 A student is tied to its resolution, its init noise (stored in the file) and, in practice, the prompts it was

@@ -34,7 +34,8 @@ for frame t of each pair (no gradient) is warped to a frame u up to --carry_gap 
 last step runs from it (at --carry_sigma). That output gets the Huber and LPIPS terms against the teacher's frame u
 and --carry_lam (default lam) times an L1 against the warped output, weighted by the flow's weight. With probability
 --carry_rollout the carried output is itself carried once (through a frame between t and u), as in the steady state
-of the stream.
+of the stream. --carry_fill lut fills in where the flow fails with frame u through the colour map of frame t's input
+and 2-step output, as `Carry(fill="lut")` does with the keyframe batch.
 
 Recipe of the released 2-step student (runs/lam4_2step): --student_steps 2 --lam 4 --grad_ckpt, 1500 steps,
 about 8 GB and 2 s/step (56 min) on an RTX 3090 Ti. One step: drop --grad_ckpt (16.5 GB, 1.0 s/step).
@@ -56,7 +57,7 @@ from torch.utils.checkpoint import checkpoint
 
 import _paths  # noqa: F401
 from vibe_stream import lora
-from vibe_stream.carry import Carry, holds
+from vibe_stream.carry import Carry, apply_colour_map, fit_colour_map, holds
 from vibe_stream.temporal_loss import masked_warp_l1, occlusion_mask, warp
 from vibe_stream.vibe_model import VibeModel, flow_step
 
@@ -91,6 +92,8 @@ def main():
                    help="noise level the carried step starts from (default: the last step's, 0.7496 for 2 steps)")
     p.add_argument("--carry_lam", type=float, default=None,
                    help="weight of the carried step's temporal term (default: --lam)")
+    p.add_argument("--carry_fill", choices=["frame", "lut"], default="frame",
+                   help="what fills in where the flow fails: the frame, or the frame through the colour map (carry.py)")
     p.add_argument("--init", default=None, help="start the student from this LoRA file (same rank and noise)")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--log_every", type=int, default=50)
@@ -147,15 +150,23 @@ def main():
                           borderMode=cv2.BORDER_REPLICATE)
         return guess, holds(cur_in, prev_in, fl, tau).astype(np.float32)
 
-    def carry_step(guesses, weights, img_lat_c, emb_c):
-        """The last student step from (1 - s1) (w enc(guess) + (1 - w) enc(frame)) + s1 noise (DC-AE latents)."""
+    def carry_step(guesses, weights, img_lat_c, emb_c, fills=None):
+        """The last student step from (1 - s1) (w enc(guess) + (1 - w) enc(fill)) + s1 noise (DC-AE latents); the fill
+        is the frame (img_lat_c) unless given."""
         ts2, sg2 = m.schedules[2]
         s, t = (sg2[1], ts2[1]) if a.carry_sigma is None else (a.carry_sigma, torch.tensor(1000.0 * a.carry_sigma, device=dev))
         zg = m.encode(guesses).clone()
+        zf = img_lat_c if fills is None else m.encode(fills).clone()
         wl = F.adaptive_avg_pool2d(torch.from_numpy(np.stack(weights))[:, None].to(dev), lat_n)
-        x = (1 - s) * (wl * zg + (1 - wl) * img_lat_c) + s * m.noise
+        x = (1 - s) * (wl * zg + (1 - wl) * zf) + s * m.noise
         with torch.autocast("cuda", dtype=torch.bfloat16):
             return flow_step(x, m.velocity(x, img_lat_c, emb_c, t), s, 0.0)
+
+    def colour_fills(cmaps, frames):
+        """Each frame (H, W, 3) uint8 through its colour map, or None when the fill is the frame itself."""
+        if cmaps is None:
+            return None
+        return [apply_colour_map(c, torch.from_numpy(f[None]).to(dev))[0].cpu().numpy() for c, f in zip(cmaps, frames)]
 
     def gblur(x, sigma):
         r = int(3 * sigma + 0.5)
@@ -260,6 +271,9 @@ def main():
             # optionally through one intermediate carried frame (as in the steady state of the stream)
             with torch.no_grad():
                 src = m.decode_u8(x0[0::2].detach())
+                cmaps = None if a.carry_fill == "frame" else [
+                    fit_colour_map(torch.from_numpy(d["frames"][t][None]).to(dev), torch.from_numpy(o[None]).to(dev))
+                    for (d, k, t), o in zip(items, src)]
             chains = []
             for (d, k, t) in items:
                 u = t + random.randint(1, min(a.carry_gap, nfr - 1 - t))
@@ -270,15 +284,19 @@ def main():
                 with torch.no_grad():
                     st = [carry_start(src[i], c[0]["frames"][c[2]], c[0]["frames"][c[3]]) for i, c in hop]
                     il_m = torch.from_numpy(np.stack([c[0]["img_lat"][c[3]] for _, c in hop])).to(dev)
+                    fl_m = colour_fills(None if cmaps is None else [cmaps[i] for i, _ in hop],
+                                        [c[0]["frames"][c[3]] for _, c in hop])
                     out_m = m.decode_u8(carry_step([g for g, _ in st], [w for _, w in st], il_m,
-                                                   torch.stack([emb[2 * i] for i, _ in hop])))
+                                                   torch.stack([emb[2 * i] for i, _ in hop]), fl_m))
                 src = list(src)
                 for (i, _), o in zip(hop, out_m):
                     src[i] = o
             st = [carry_start(src[i], d["frames"][t if mid is None else mid], d["frames"][u])
                   for i, (d, k, t, mid, u) in enumerate(chains)]
             il_c = torch.from_numpy(np.stack([d["img_lat"][u] for d, _, _, _, u in chains])).to(dev)
-            x0c = carry_step([g for g, _ in st], [w for _, w in st], il_c, emb[0::2])
+            with torch.no_grad():
+                fl_c = colour_fills(cmaps, [d["frames"][u] for d, _, _, _, u in chains])
+            x0c = carry_step([g for g, _ in st], [w for _, w in st], il_c, emb[0::2], fl_c)
             tlat_c = torch.from_numpy(np.stack([d[f"tlat_{k}"][u] for d, k, _, _, u in chains])).to(dev)
             timg_c = torch.from_numpy(np.stack([d[f"timg_{k}"][u, Y:Y + S, X:X + S] for d, k, _, _, u in chains]))
             timg_c = timg_c.to(dev).permute(0, 3, 1, 2).float() / 127.5 - 1
@@ -330,6 +348,7 @@ def main():
                                                      w_dmd=a.w_dmd, w_eq=a.w_eq, eq_shift=a.eq_shift,
                                                      w_tex=a.w_tex, w_carry=a.w_carry,
                                                      carry_sigma=a.carry_sigma if a.w_carry > 0 else None,
+                                                     carry_fill=a.carry_fill if a.w_carry > 0 else None,
                                                      carry_lam=a.carry_lam, init=a.init))
     print(f"[train] saved {run / 'lora.safetensors'} after {time.perf_counter() - t0:.0f} s", flush=True)
 

@@ -77,6 +77,9 @@ def main():
     p.add_argument("--carry_sigma", type=float, default=None,
                    help="with --carry: noise level of the carried start "
                         "(default: the student's, as recorded in it or in the engine's spec)")
+    p.add_argument("--carry_fill", choices=["frame", "lut"], default=None,
+                   help="with --carry: fill where the flow fails with the frame or the frame through the keyframe's "
+                        "colour map (default: the student's, as recorded in it or in the engine's spec)")
     a = p.parse_args()
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -91,7 +94,7 @@ def main():
     vibe = VibeModel(size=size)
     tf = TemporalFilter(*a.temporal_filter) if a.temporal_filter else None
     ed = StreamEditor(vibe, TinyAutoencoder(), engine=engine, student=a.student, temporal_filter=tf,
-                      carry=Carry(a.keyframe_every, sigma=a.carry_sigma) if a.carry else None)
+                      carry=Carry(a.keyframe_every, sigma=a.carry_sigma, fill=a.carry_fill) if a.carry else None)
     clips = a.clips or sorted(f.stem for f in Path(a.clips_dir).glob("*.mp4"))
     gpu = torch.cuda.get_device_name().replace("NVIDIA ", "").replace("GeForce ", "")
     footer = f"{ed.steps}-step VIBE student, {size}px, {backend}, {gpu}"

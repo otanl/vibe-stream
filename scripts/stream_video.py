@@ -50,6 +50,9 @@ def main():
     p.add_argument("--carry_sigma", type=float, default=None,
                    help="with --carry: noise level of the carried start "
                         "(default: the student's, as recorded in it or in the engine's spec)")
+    p.add_argument("--carry_fill", choices=["frame", "lut"], default=None,
+                   help="with --carry: fill where the flow fails with the frame or the frame through the keyframe's "
+                        "colour map (default: the student's, as recorded in it or in the engine's spec)")
     p.add_argument("--out_json", default=None)
     a = p.parse_args()
     prompt = PROMPTS.get(a.prompt, a.prompt)
@@ -70,7 +73,7 @@ def main():
     tae = TinyAutoencoder()
     tf = TemporalFilter(*a.temporal_filter) if a.temporal_filter else None
     ed = StreamEditor(vibe, tae, engine=engine, student=a.student, batch_size=a.batch, temporal_filter=tf,
-                      carry=Carry(a.keyframe_every, sigma=a.carry_sigma) if a.carry else None)
+                      carry=Carry(a.keyframe_every, sigma=a.carry_sigma, fill=a.carry_fill) if a.carry else None)
     embed_ms = ed.set_prompt(prompt, frames[0])
     torch.cuda.reset_peak_memory_stats()
     run_frames = list(islice(cycle(frames), a.loop_frames)) if a.loop_frames else frames
@@ -80,7 +83,8 @@ def main():
     if tf is not None:
         backend += f", temporal filter {tf.low:g}/{tf.high:g}"
     if ed.carry is not None:
-        backend += f", carry-over ({ed.carry.keyframes} keyframe batches of {-(-len(run_frames) // ed.batch_size)})"
+        backend += (f", carry-over ({ed.carry.keyframes} keyframe batches of {-(-len(run_frames) // ed.batch_size)}, "
+                    f"fill {ed.carry_fill()})")
     print(f"[run] {backend}, {ed.steps}-step student, batch {ed.batch_size}, {len(run_frames)} frames", flush=True)
     print(f"[run] loop      {tm.loop_fps:6.1f} fps  ({tm.frames} frames in {tm.loop_s:.2f} s, steady state)")
     print(f"[run] step-only {tm.step_fps:6.1f} fps  ({mean(tm.step_ms) / ed.batch_size:.1f} ms per frame)")

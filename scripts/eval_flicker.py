@@ -96,11 +96,11 @@ def evaluate(a):
     size = int(meta["size"])
     prompts = {k: v for k, v in meta.get("prompts", PROMPTS).items() if k in CLIP_CAPTIONS}
     vibe = VibeModel(size=size)
-    carry = Carry(a.keyframe_every, tau=a.carry_tau, sigma=a.carry_sigma) if a.carry else None
+    carry = Carry(a.keyframe_every, tau=a.carry_tau, sigma=a.carry_sigma, fill=a.carry_fill) if a.carry else None
     ed = StreamEditor(vibe, TinyAutoencoder(), student=a.student, carry=carry)
     frames = {c: read_video_frames(Path(a.clips_dir) / f"{c}.mp4", size, a.frames) for c in a.clips}
     res, vids = {"student": str(a.student), "filter": a.filter, "frames": a.frames, "clips": list(a.clips),
-                 "carry": a.keyframe_every if a.carry else None}, {}
+                 "carry": a.keyframe_every if a.carry else None, "carry_fill": ed.carry_fill() if a.carry else None}, {}
     for c, fr in frames.items():
         for key, prompt in prompts.items():
             ed.set_prompt(prompt, fr[0])
@@ -157,6 +157,9 @@ def main():
     p.add_argument("--carry_sigma", type=float, default=None,
                    help="with --carry: noise level of the carried start "
                         "(default: the student's, as recorded in it or in the engine's spec)")
+    p.add_argument("--carry_fill", choices=["frame", "lut"], default=None,
+                   help="with --carry: fill where the flow fails with the frame or the frame through the keyframe's "
+                        "colour map (default: the student's, as recorded in it or in the engine's spec)")
     p.add_argument("--carry_tau", type=float, default=12.0,
                    help="with --carry: tolerance of the flow check, in 8-bit levels (Carry.tau)")
     p.add_argument("--videos", action="store_true", help="also write input | plain | filtered per clip and prompt")

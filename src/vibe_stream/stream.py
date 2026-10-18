@@ -89,6 +89,7 @@ class StreamEditor:
         # the noise level a student was trained to start its carried step from (engines built before it was recorded
         # in the spec have None)
         self.trained_carry_sigma = engine.spec.carry_sigma if engine is not None else meta.get("carry_sigma")
+        self.trained_carry_fill = engine.spec.carry_fill if engine is not None else meta.get("carry_fill")
         self._t_carry = {}
         # TensorRT adds stream synchronisations when enqueued on the legacy default stream
         self.stream = torch.cuda.Stream(self.device)
@@ -122,11 +123,18 @@ class StreamEditor:
                                 if self.engine is not None else torch.tensor(1000.0 * s, device=self.device))
         return self._t_carry[s], s
 
+    def carry_fill(self) -> str:
+        """What fills in where the flow fails: Carry(fill=...) if given, else the student's, else the frame."""
+        if self.carry is not None and self.carry.fill:
+            return self.carry.fill
+        return self.trained_carry_fill or "frame"
+
     @torch.inference_mode()
     def edit(self, frames: torch.Tensor, carry=None) -> torch.Tensor:
         """(B, H, W, 3) uint8 on the GPU -> edited (B, H, W, 3) uint8 on the GPU. With `carry` = (warped previous
-        output (B, H, W, 3) uint8, weight (B, 1, h, w) on the latent grid) one step runs, from
-        (1 - s) * (w * enc(warped) + (1 - w) * enc(frames)) + s * noise, s from `carry_start` (see `carry`)."""
+        output (B, H, W, 3) uint8, weight (B, 1, h, w) on the latent grid, fill (B, H, W, 3) uint8 or None for the
+        frames) one step runs, from (1 - s) * (w * enc(warped) + (1 - w) * enc(fill)) + s * noise, s from
+        `carry_start` (see `carry`)."""
         if self.emb is None:
             raise RuntimeError("call set_prompt first")
         il = self.tae.encode_u8(frames)
@@ -135,9 +143,10 @@ class StreamEditor:
             plan = [(self.t_engine[i] if self.engine is not None else self.timesteps[i], self.sigmas[i], self.sigmas[i + 1])
                     for i in range(self.steps)]
         else:
-            guess, w = carry
+            guess, w, fill = carry
             t, s = self.carry_start()
-            x = (1 - s) * (w * self.tae.encode_u8(guess).float() + (1 - w) * il.float()) + s * x
+            zf = il if fill is None else self.tae.encode_u8(fill)
+            x = (1 - s) * (w * self.tae.encode_u8(guess).float() + (1 - w) * zf.float()) + s * x
             plan = [(t, s, self.sigmas[-1])]
         for t, s0, s1 in plan:
             if self.engine is not None:
@@ -197,9 +206,10 @@ class StreamEditor:
             plan = self.carry.plan(arr) if self.carry is not None else None
             gpu = pin_in[s].to(self.device, non_blocking=True)
             ev0[s].record()
-            out = self.edit(gpu, None if plan is None else self.carry.start(gpu, plan, self.noise.shape[-1]))
+            fill = self.carry_fill()
+            out = self.edit(gpu, None if plan is None else self.carry.start(gpu, plan, self.noise.shape[-1], fill))
             if self.carry is not None:
-                self.carry.update(gpu, out)
+                self.carry.update(gpu, out, fill)
             if self.tfilter is not None:
                 out = self.tfilter(gpu, out, flows)
             ev1[s].record()
