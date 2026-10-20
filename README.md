@@ -18,17 +18,17 @@ at the same speed at 768 and a few percent slower at 640. The numbers below say 
 
 ## Demo
 
-https://github.com/user-attachments/assets/1e6c7754-9cb5-41bc-add8-d00b65fecdfd
+https://github.com/user-attachments/assets/6db207d1-1b0c-45b7-a3dc-989f4862c664
 
-Input | oil painting | anime on five DAVIS-2017 clips through the real-time path at 640 px on an RTX 3090 Ti: the
-student trained for the carry-over (`lam4_carry_s05_2step_640`) with the transformer as a TensorRT engine, taesana,
-the carry-over and the temporal filter 0.7 / 0.3 (`scripts/make_demo.py --carry --temporal_filter 0.7 0.3`; see
-"Flicker"). Each output panel shows the loop fps of its run: 43-44 fps on these short clips, 44.1 fps on the
-480-frame loop (Speed).
+Input | oil painting | anime on five DAVIS-2017 clips through the real-time path at 768 px on an RTX 3090 Ti: the
+student trained for the carry-over with the colour-mapped fill (`lam4_carry_s05_lut_2step_768`) with the transformer
+as a TensorRT engine, taesana, the carry-over and the temporal filter 0.7 / 0.3 (`scripts/make_demo.py --carry
+--temporal_filter 0.7 0.3`; see "Flicker"). Each output panel shows the loop fps of its run: 30-31 fps on these short
+clips, 31.1 fps on the 480-frame loop (Speed).
 
-The same clips on the plain 2-step path (the released student, about twice the flicker; 27-29 fps):
+The same clips on the plain 2-step path at 768 (the released student, about twice the flicker; 20-21 fps):
 
-https://github.com/user-attachments/assets/26081288-3447-4734-902b-ddc4dcb9c8a9
+https://github.com/user-attachments/assets/4b1e7ff2-0bf6-47f0-80e7-4ec18ed29712
 
 Input clips: [DAVIS-2017](https://davischallenge.org/), see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
@@ -308,6 +308,19 @@ trained as `lam4_carry_s05` and `lam4_carry_s05_lut` at 640 (84 and 90 min at 3.
   of 35-37. Flicker goes down a little (with the filter 10.1 / 4.9), edit strength stays (CLIP 0.206 / 0.179 with
   the filter), texture goes down a little (Sobel 10.1 to 9.3 with the filter), and the loop speed is unchanged
   (Speed).
+
+**Brush strokes and resolution (oil).** Oil strokes come out finer the higher the resolution, and seen as a whole the
+frame reads less like a painting (DreamLite does the same). A probe on the 8-step teacher at 768 (`blackswan`,
+`goat`, `parkour`, `camel`, frame 40, judged by eye; a mid / high band-energy ratio did not separate the variants)
+says VIBE paints strokes of a roughly fixed size in pixels. Three prompts asking for larger strokes (thick impasto,
+broad visible brushstrokes, palette knife) and an input softened to 384 or 256 px and scaled back change neither the
+stroke size nor much else. Only the working resolution does: the 640 output scaled up to 768 has bolder strokes and
+colours, and the 512 one bolder still, but it repaints the scene (an orange camel, a red face). In the demo, though,
+most of the brushwork goes with the carry-over. In a 2 x 2 oil comparison on the engine of
+`lam4_carry_s05_lut_2step_768` (2 steps, + filter, carry-over, carry-over + filter) the 2-step path keeps the
+teacher's strokes (dabs on the water, strokes on the walls), the carried output keeps the edges and smooths the
+surfaces, and the filter changes little either way. On video the 2-step path's flicker weighs more than the lost
+strokes, so carry-over + filter stays the setting.
 
 ## Setup
 

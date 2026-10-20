@@ -98,7 +98,8 @@ def main():
     clips = a.clips or sorted(f.stem for f in Path(a.clips_dir).glob("*.mp4"))
     gpu = torch.cuda.get_device_name().replace("NVIDIA ", "").replace("GeForce ", "")
     footer = f"{ed.steps}-step VIBE student, {size}px, {backend}, {gpu}"
-    options = (["carry-over"] if ed.carry is not None else []) + (
+    carried = "carry-over (colour-mapped fill)" if ed.carry_fill() == "lut" else "carry-over"
+    options = ([carried] if ed.carry is not None else []) + (
         [f"temporal filter {tf.low:g}/{tf.high:g}"] if tf is not None else [])
     if options:
         footer += "\n" + " + ".join(options)
