@@ -16,6 +16,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 import torch
+from PIL import Image
 
 import _paths  # noqa: F401
 from vibe_stream import lora
@@ -67,7 +68,9 @@ def main():
     p.add_argument("--out", required=True)
     p.add_argument("--clips_dir", default=str(ROOT / EVAL_CLIPS_DIR))
     p.add_argument("--clips", nargs="*", default=None, help="clip names (default: every mp4 in --clips_dir)")
-    p.add_argument("--prompts", nargs="+", default=list(PROMPTS), help="preset keys")
+    p.add_argument("--prompts", nargs="*", default=None, help="preset keys (default: all, or none with --style_images)")
+    p.add_argument("--style_images", nargs="*", default=[],
+                   help="one panel per image, its style turned into the instruction by VIBE's Qwen3-VL")
     p.add_argument("--max_frames", type=int, default=None)
     p.add_argument("--temporal_filter", type=float, nargs=2, default=None, metavar=("LOW", "HIGH"),
                    help="display-side temporal filter (vibe_stream.temporal_filter), e.g. 0.7 0.3")
@@ -95,6 +98,11 @@ def main():
     tf = TemporalFilter(*a.temporal_filter) if a.temporal_filter else None
     ed = StreamEditor(vibe, TinyAutoencoder(), engine=engine, student=a.student, temporal_filter=tf,
                       carry=Carry(a.keyframe_every, sigma=a.carry_sigma, fill=a.carry_fill) if a.carry else None)
+    instructions = {key: PROMPTS[key] for key in (a.prompts if a.prompts is not None else
+                                                  [] if a.style_images else list(PROMPTS))}
+    for path in a.style_images:
+        instructions[Path(path).stem] = vibe.style_prompt(Image.open(path).convert("RGB"))
+        print(f"[style] {Path(path).stem}: {instructions[Path(path).stem]}", flush=True)
     clips = a.clips or sorted(f.stem for f in Path(a.clips_dir).glob("*.mp4"))
     gpu = torch.cuda.get_device_name().replace("NVIDIA ", "").replace("GeForce ", "")
     footer = f"{ed.steps}-step VIBE student, {size}px, {backend}, {gpu}"
@@ -109,8 +117,8 @@ def main():
         frames = read_video_frames(src, size, a.max_frames)
         fps = video_fps(src)
         panels = [[label(label(f, f"input: {clip}"), footer, bottom=True) for f in frames]]
-        for key in a.prompts:
-            ed.set_prompt(PROMPTS[key], frames[0])
+        for key, instruction in instructions.items():
+            ed.set_prompt(instruction, frames[0])
             outs, tm = ed.run(frames, warmup_batches=1)
             panels.append([label(o, f"{key}: {tm.loop_fps:.0f} fps loop") for o in outs])
             print(f"[demo] {clip:<14} {key:<6} {len(frames)} frames, loop {tm.loop_fps:.1f} fps", flush=True)

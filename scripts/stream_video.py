@@ -17,6 +17,7 @@ from statistics import mean
 
 import numpy as np
 import torch
+from PIL import Image
 
 import _paths  # noqa: F401
 from vibe_stream import lora
@@ -34,6 +35,8 @@ def main():
     p.add_argument("--input", required=True)
     p.add_argument("--output", default=None)
     p.add_argument("--prompt", default="oil", help=f"an instruction, or a preset key: {', '.join(PROMPTS)}")
+    p.add_argument("--style_image", default=None,
+                   help="instead of --prompt: an image whose style VIBE's Qwen3-VL turns into the instruction")
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument("--engine", help="TensorRT engine from scripts/build_trt.py")
     g.add_argument("--student", help="student LoRA file (PyTorch bf16 path)")
@@ -65,11 +68,14 @@ def main():
         engine = None
         meta = lora.load(a.student)[1]
         size, trained = int(meta.get("size", 768)), meta.get("prompts", {})
-    if trained and prompt not in trained.values():
-        print(f"[note] the student was trained on {list(trained.values())}; other instructions may come out weaker")
     frames = read_video_frames(a.input, size, a.max_frames)
     print(f"[input] {a.input}: {len(frames)} frames at {size}", flush=True)
     vibe = VibeModel(size=size)
+    if a.style_image:
+        prompt = vibe.style_prompt(Image.open(a.style_image).convert("RGB"))
+        print(f"[style] {a.style_image}: {prompt}", flush=True)
+    if trained and prompt not in trained.values():
+        print(f"[note] the student was trained on {list(trained.values())}; other instructions may come out weaker")
     tae = TinyAutoencoder()
     tf = TemporalFilter(*a.temporal_filter) if a.temporal_filter else None
     ed = StreamEditor(vibe, tae, engine=engine, student=a.student, batch_size=a.batch, temporal_filter=tf,

@@ -28,6 +28,11 @@ ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_WEIGHTS = ROOT / "models" / "VIBE-Image-Edit-DistilledCFG"
 LATENT_CHANNELS = 32
 NOISE_SEED = 42
+# Asked of VIBE's own Qwen3-VL to turn a style reference image into an instruction (`VibeModel.style_prompt`).
+STYLE_QUESTION = ("Write one instruction for an image editing model that restyles any photo into the artistic style of "
+                  "this artwork. Describe only the style (medium, technique, brushwork or linework, colour palette, "
+                  "texture), not the subject or the scene, and do not name the artist or the work. Start with "
+                  "'transfer this to' and use at most 40 words.")
 
 
 def add_vibe_to_path() -> None:
@@ -135,6 +140,51 @@ class VibeModel:
             if offloaded:
                 self.offload_text_encoder()
         return emb.contiguous()
+
+    @torch.inference_mode()
+    def embed_with_reference(self, prompt: str, frame: np.ndarray, reference: np.ndarray | Image.Image) -> torch.Tensor:
+        """Like `embed`, with a second image after the frame in the same user turn, e.g. "transfer this to the artistic
+        style of the second image". VIBE was trained with one image; the second one brings its content along as well
+        as its style. Does not bring an offloaded text encoder back."""
+        pipe = self.pipe
+        f = Image.fromarray(frame)
+        ref = reference if isinstance(reference, Image.Image) else Image.fromarray(reference)
+        content = [{"type": "image", "image": f}, {"type": "image", "image": ref},
+                   {"type": "text", "text": pipe.edit_query_template.format(instruction=prompt.strip())}]
+        text = pipe.tokenizer.apply_chat_template([{"role": "user", "content": content}], tokenize=False,
+                                                  add_generation_prompt=False)
+        x = pipe.tokenizer(text=[text], images=[f, ref], padding=True, return_tensors="pt",
+                           min_pixels=pipe.min_pixels, max_pixels=pipe.max_pixels).data
+        mi = pipe.prepare_initial_input_embeddings(**{k: v.to(self.device) for k, v in x.items()})
+        hidden = pipe.text_encoder.language_model(input_ids=None, **mi).last_hidden_state
+        meta = pipe.transformer.get_hidden_states_for_meta_tokens(hidden, mi["attention_mask"])
+        return pipe.transformer.forward_edit_heads(meta.shape[0], meta)[0].contiguous()
+
+    @torch.inference_mode()
+    def style_prompt(self, image: np.ndarray | Image.Image, max_new_tokens: int = 80) -> str:
+        """An instruction in the style of a reference image, written by VIBE's own Qwen3-VL (greedy, STYLE_QUESTION).
+
+        Handing the reference to the encoder next to the frame instead brings its content along (figures, lettering),
+        and cutting it into shuffled tiles first removes the content but most of the style too. Like `embed`, brings
+        the text encoder back to the GPU for the call if it was offloaded.
+        """
+        ref = image if isinstance(image, Image.Image) else Image.fromarray(image)
+        proc, te = self.pipe.tokenizer, self.pipe.text_encoder
+        msg = [{"role": "user", "content": [{"type": "image", "image": ref}, {"type": "text", "text": STYLE_QUESTION}]}]
+        text = proc.apply_chat_template(msg, tokenize=False, add_generation_prompt=True)
+        x = proc(text=[text], images=[ref], return_tensors="pt", min_pixels=self.pipe.min_pixels,
+                 max_pixels=self.pipe.max_pixels).data
+        offloaded = next(te.parameters()).device != self.device
+        if offloaded:
+            te.to(self.device)
+        try:
+            x = {k: v.to(self.device) for k, v in x.items()}
+            ids = te.generate(**x, max_new_tokens=max_new_tokens, do_sample=False)
+        finally:
+            if offloaded:
+                self.offload_text_encoder()
+        out = proc.batch_decode(ids[:, x["input_ids"].shape[1]:], skip_special_tokens=True)[0]
+        return " ".join(out.split())
 
     @torch.no_grad()
     def project_embedding(self, emb: torch.Tensor) -> torch.Tensor:

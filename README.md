@@ -322,6 +322,43 @@ teacher's strokes (dabs on the water, strokes on the walls), the carried output 
 surfaces, and the filter changes little either way. On video the 2-step path's flicker weighs more than the lost
 strokes, so carry-over + filter stays the setting.
 
+### Other instructions and style from a reference image
+
+**Prompts the student never saw.** `lam4_carry_s05_lut_2step_768` was distilled on the two style prompts only. On its
+2-step path (the four evaluation clips x 8 frames, one embedding per clip) it keeps up with the 8-step teacher on new
+ones: CLIP directional similarity 0.86-1.24 of the teacher's on seven styles (watercolour, pencil sketch, ukiyo-e,
+cyberpunk, pixel art, stained glass, claymation) and 0.96-1.00 on three global edits (winter, night, sunset), at LPIPS
+0.13-0.37 to the teacher, where the base model run as a 2-step student, blurred and washed out, is at 0.18-0.66. The
+LoRA has learned to sample in two steps more than it has learned two styles. It falls short where the teacher
+rebuilds the scene: "built from LEGO bricks" (0.80: the teacher turns a person into a minifigure, the student
+recolours the shirt), cyberpunk (0.86: no neon signs), claymation and pencil sketch (the teacher drops the background,
+the student keeps it, which is where its ratios above 1 come from). On the streaming path (carry-over + filter, five
+clips) the flicker of the new prompts falls to 0.36-0.64 of the 2-step path's, as for oil and anime (0.46 / 0.47),
+and ends at or below oil's.
+
+**Style from a reference image** (`stream_video.py --style_image`, `make_demo.py --style_images`). Three ways compared
+on nine public-domain works, by the CLIP image similarity to the reference gained over the input (teacher / student,
+three clips): VIBE's own Qwen3-VL writes an instruction from the reference without naming artist or work
+(`VibeModel.style_prompt`), 0.081 / 0.087; the reference goes to the encoder next to the frame, "transfer this to
+the artistic style of the second image" (`VibeModel.embed_with_reference`), 0.141 / 0.120; the artist and title as
+the prompt, 0.101 / 0.095. The second scores highest partly by copying content: Klimt's couple, Mucha's model,
+Beardsley's figure, Hokusai's wave and a poster's lettering appear in the picture (as ghosts in the student). Cutting
+the reference into shuffled 4 x 4 or 8 x 8 tiles first removes the content and most of the style with it (student
+0.097 / 0.080; the teacher paints the tile seams), and adding the tiles to the written instruction changes little.
+The options use the written instruction. It is made once per clip, so the loop runs as fast as with any prompt (31
+fps at 768 with carry-over + filter). It works for styles with a clear medium or palette (Van Gogh, Hokusai, Mucha,
+Beardsley, Kandinsky) and not where VIBE cannot paint the style over the kept layout: Klimt's ornament comes out as a
+gold tint, and Monet and Seurat barely register, with the artist named too.
+
+On the streaming path, styles carried by texture fade after the keyframe batch: the reference gain of Van Gogh,
+Kandinsky and Klimt drops by a quarter to a third once the carry-over starts and then stays flat, while palette
+styles (Hokusai's blue, Mucha's sepia, Beardsley's black and white) strengthen. Oil and anime, which the carried step
+was trained on, do not fade. A keyframe every 4 batches brings the later batches most of the way back (Van Gogh
+0.061 to 0.096; 2-step path 0.115) at 27.8 fps for 16-22 % more flicker, but the style visibly pulses with the
+keyframes; every 2 batches adds little more. Starting the carried step from sigma 0.6 instead of the trained 0.5
+holds a little more (0.076) for 6-10 % more flicker, without pulsing. Training the carried step on more styles is the
+open fix.
+
 ## Setup
 
 The code expects an upstream VIBE checkout next to it (or `VIBE_REPO` pointing at one) and the weights in `models/`:
@@ -351,6 +388,9 @@ python scripts/stream_video.py --input ... --student runs/lam4_2step/lora.safete
 # a student trained for another start or fill of the carried step (--carry_sigma, --carry_fill) records it, and so
 # does its engine
 python scripts/stream_video.py --input ... --engine ... --temporal_filter 0.7 0.3 --carry
+# Style from a reference image: VIBE's Qwen3-VL turns it into the instruction, once per clip
+python scripts/stream_video.py --input ... --engine ... --temporal_filter 0.7 0.3 --carry --style_image ref.jpg
+python scripts/make_demo.py --engine ... --carry --temporal_filter 0.7 0.3 --style_images a.jpg b.jpg --out out/style
 # Flicker of a student, plain and filtered, and the shift probe; --table compares result files
 python scripts/eval_flicker.py --student runs/lam4_2step_640/lora.safetensors --out out/flicker/lam4_2step_640.json
 # Demo video: input | oil | anime for every clip in assets/davis_mp4 through the same path (H.264 if ffmpeg is on PATH)
@@ -374,9 +414,11 @@ python scripts/eval_flicker.py --student runs/lam4_carry_s05_lut_2step_640/lora.
     --out out/flicker/lam4_carry_s05_lut_2step_640_carry.json
 ```
 
-A student is tied to its resolution, its init noise (stored in the file) and, in practice, the prompts it was
-trained on; other instructions run but come out weaker. A TensorRT engine is tied to one resolution, one batch size,
-one TensorRT version and platform; `<engine>.json` records them and a mismatch is refused.
+A student is tied to its resolution and its init noise (stored in the file). Other instructions than the ones it was
+trained on work for styles and global edits, less for edits that rebuild the scene, and the carried step holds
+texture styles less well than its own (Results, "Other instructions and style from a reference image"). A TensorRT
+engine is tied to one resolution, one batch size, one TensorRT version and platform; `<engine>.json` records them and
+a mismatch is refused.
 
 ## Layout
 
