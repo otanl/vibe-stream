@@ -412,6 +412,14 @@ python scripts/train_student.py --data data/teacher_640 --run runs/lam4_carry_s0
     --lam 4 --w_carry 1 --carry_sigma 0.5 --carry_fill lut --grad_ckpt
 python scripts/eval_flicker.py --student runs/lam4_carry_s05_lut_2step_640/lora.safetensors --carry \
     --out out/flicker/lam4_carry_s05_lut_2step_640_carry.json
+
+# Fine-tuning data for style from a reference image (work in progress): public-domain artworks from the Art Institute
+# of Chicago API (CC0 images), Open Images validation photos listed as CC BY 2.0 (attribution kept in images.jsonl),
+# 8-step candidates under two ways of conditioning (~2.6 s per pair at 768), then one target per pair or none
+python scripts/fetch_style_refs.py --out data/style_refs_aic
+python scripts/fetch_content_images.py --out data/content_openimages --count 2000
+python scripts/make_style_data.py --content data/content_openimages --refs data/style_refs_aic --out data/style_ft_768
+python scripts/select_style_targets.py --data data/style_ft_768
 ```
 
 A student is tied to its resolution and its init noise (stored in the file). Other instructions than the ones it was
