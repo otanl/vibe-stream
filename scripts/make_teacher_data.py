@@ -5,10 +5,18 @@ the input frames (t -> t+1), their DC-AE latents, and per prompt the clip embedd
 and the teacher's latents and decoded images. All teacher runs start from the same init noise (CPU float32 draw,
 seed 42), as the student will at run time.
 
+Reference styles: --style_list names reference images; each window gets --styles_per_window of them (keys s0, s1,
+...; every reference used about equally, fixed order), handed to the encoder next to the window's first frame
+(`VibeModel.embed_with_reference`), with the path stored as ref_s<i>. --base_lora merges a fine-tune of the base
+model (scripts/train_style_ft.py) into the teacher first. --reuse copies frames, flows, latents and the prompt keys
+from an earlier run over the same windows instead of recomputing them; those keep that run's teacher.
+
 Before that it checks, on one frame, that this repo's sampler reproduces VIBE's own pipeline call and that the
 first-order k-step formula matches VIBE's scheduler for k = 1, 2.
 
 Usage: python scripts/make_teacher_data.py --out data/teacher_768      (47 windows: about 1 h on an RTX 3090 Ti)
+       python scripts/make_teacher_data.py --out data/teacher_768_refs --reuse data/teacher_768 \
+           --style_list data/style_ft_768/student_refs.txt --base_lora runs/style_ft_b/lora.safetensors
 """
 import argparse
 import json
@@ -20,9 +28,10 @@ import torch
 from PIL import Image
 
 import _paths  # noqa: F401
+from vibe_stream import lora
 from vibe_stream.metrics import farneback, read_video_frames
 from vibe_stream.presets import PROMPTS, TRAIN_CLIPS_DIR
-from vibe_stream.vibe_model import ROOT, VibeModel
+from vibe_stream.vibe_model import REFERENCE_INSTRUCTION, ROOT, VibeModel
 
 
 def main():
@@ -33,10 +42,19 @@ def main():
     p.add_argument("--teacher_steps", type=int, default=8)
     p.add_argument("--window", type=int, default=10, help="frames per window")
     p.add_argument("--starts", type=int, nargs="+", default=[0, 40], help="window start frames in each clip")
+    p.add_argument("--prompts", nargs="*", default=list(PROMPTS), help="preset keys")
+    p.add_argument("--style_list", default=None, help="text file with one reference image path per line")
+    p.add_argument("--styles_per_window", type=int, default=4)
+    p.add_argument("--base_lora", default=None, help="fine-tune of the base model merged into the teacher")
+    p.add_argument("--reuse", default=None, help="earlier teacher dir over the same windows to copy from")
     a = p.parse_args()
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
+    refs = [Path(line.strip()) for line in Path(a.style_list).read_text(encoding="utf-8").splitlines()
+            if line.strip()] if a.style_list else []
     m = VibeModel(size=a.size)
+    if a.base_lora:
+        lora.merge(m.tr, lora.load(a.base_lora)[0])
     clips = sorted(Path(a.clips_dir).glob("*.mp4"))
     if not clips:
         raise SystemExit(f"no clips in {a.clips_dir}")
@@ -71,20 +89,37 @@ def main():
             n += 1
             if path.exists():
                 continue
-            fr = np.stack(frames[s:s + a.window])
-            flows = np.stack([farneback(fr[i], fr[i + 1]) for i in range(a.window - 1)]).astype(np.float16)
-            img_lat = m.encode(list(fr))
-            rec = dict(clip=clip.stem, start=s, frames=fr, flows=flows, img_lat=img_lat.cpu().numpy())
-            for key, prompt in PROMPTS.items():
-                e = m.embed(prompt, fr[0])
+            if a.reuse:
+                old = np.load(Path(a.reuse) / path.name)
+                if str(old["clip"]) != clip.stem or int(old["start"]) != s:
+                    raise SystemExit(f"{a.reuse}/{path.name} is {old['clip']}@{old['start']}, not {clip.stem}@{s}")
+                rec = {k: old[k] for k in ("clip", "start", "frames", "flows", "img_lat")}
+                for key in a.prompts:
+                    rec.update({f"{x}_{key}": old[f"{x}_{key}"] for x in ("emb", "tlat", "timg")})
+                fr, img_lat = rec["frames"], torch.from_numpy(rec["img_lat"]).to(m.device)
+            else:
+                fr = np.stack(frames[s:s + a.window])
+                flows = np.stack([farneback(fr[i], fr[i + 1]) for i in range(a.window - 1)]).astype(np.float16)
+                img_lat = m.encode(list(fr))
+                rec = dict(clip=clip.stem, start=s, frames=fr, flows=flows, img_lat=img_lat.cpu().numpy())
+            embs = {} if a.reuse else {key: m.embed(PROMPTS[key], fr[0]) for key in a.prompts}
+            for i in range(a.styles_per_window if refs else 0):
+                ref = refs[((n - 1) * a.styles_per_window + i) % len(refs)]
+                embs[f"s{i}"] = m.embed_with_reference(REFERENCE_INSTRUCTION, fr[0], Image.open(ref).convert("RGB"))
+                rec[f"ref_s{i}"] = str(ref)
+            for key, e in embs.items():
                 lat = m.sample(img_lat, e, a.teacher_steps)
                 rec[f"emb_{key}"] = e.float().cpu().numpy()
                 rec[f"tlat_{key}"] = lat.cpu().numpy()
                 rec[f"timg_{key}"] = m.decode_u8(lat)
             np.savez(path, **rec)
             print(f"[teacher] {path.name} {clip.stem}@{s}  ({time.perf_counter() - t0:.0f} s)", flush=True)
-    (out / "meta.json").write_text(json.dumps(dict(size=a.size, prompts=PROMPTS, teacher_steps=a.teacher_steps,
-                                                   nfr=a.window, windows=n, noise="cpu fp32 randn seed 42")),
+    prompts = {key: PROMPTS[key] for key in a.prompts}
+    prompts.update({f"s{i}": f"reference image to the encoder (ref_s{i} of each window): {REFERENCE_INSTRUCTION}"
+                    for i in range(a.styles_per_window if refs else 0)})
+    (out / "meta.json").write_text(json.dumps(dict(size=a.size, prompts=prompts, teacher_steps=a.teacher_steps,
+                                                   nfr=a.window, windows=n, noise="cpu fp32 randn seed 42",
+                                                   style_list=a.style_list, base_lora=a.base_lora, reuse=a.reuse)),
                                    encoding="utf-8")
     print(f"[teacher] {n} windows in {time.perf_counter() - t0:.0f} s", flush=True)
 

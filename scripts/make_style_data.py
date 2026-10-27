@@ -5,7 +5,11 @@ seed), VIBE runs --steps steps of its own scheduler from --seeds noise draws per
   A  the reference's style as an instruction written by VIBE's Qwen3-VL (`VibeModel.style_prompt`, cached per
      reference in <out>/captions.json), with the photo as usual;
   B  "transfer this to the artistic style of the second image" with the photo and the reference both given to the
-     encoder (`VibeModel.embed_with_reference`; carries the reference's content as well as its style).
+     encoder (`VibeModel.embed_with_reference`; carries the reference's content as well as its style);
+  C  the instruction of A with the photo and the reference both given to the encoder.
+--ways picks among them (A and B by default). --base_lora merges a fine-tune of the transformer
+(scripts/train_style_ft.py) first, for a further round of data from the fine-tuned model; --skip_split leaves out the
+pairs a split.json holds out, which that round does not need.
 Each candidate is saved as <out>/pairs/<content>__<ref>/<way><seed>.jpg and scored: CLIP ViT-L/14 image similarity
 to the reference minus the photo's (`ref_gain`; style, and content if copied), CLIP similarity to the photo
 (`input_sim`; content kept) and edge agreement with the photo (`edge`). One JSON line per pair in
@@ -13,6 +17,9 @@ to the reference minus the photo's (`ref_gain`; style, and content if copied), C
 resumed. Selecting targets from the candidates is left to the training side.
 Usage: python scripts/make_style_data.py --content data/content_openimages --refs data/style_refs_aic \
            data/style_refs --out data/style_ft_768
+       python scripts/make_style_data.py ... --out data/style_ft2_768 --ways B C \
+           --base_lora runs/style_ft_b/lora.safetensors --skip_split data/style_ft_768/split.json
+           (copy captions.json over first to reuse the instructions)
 """
 
 import argparse
@@ -29,10 +36,9 @@ import torch
 from PIL import Image
 
 import _paths  # noqa: F401
+from vibe_stream import lora
 from vibe_stream.metrics import CLIPScore, edge_agreement
-from vibe_stream.vibe_model import LATENT_CHANNELS, VibeModel
-
-B_INSTRUCTION = "transfer this to the artistic style of the second image"
+from vibe_stream.vibe_model import LATENT_CHANNELS, REFERENCE_INSTRUCTION, VibeModel
 
 
 def centre_square(path: Path, size: int) -> np.ndarray:
@@ -54,6 +60,9 @@ def main():
     p.add_argument("--refs_per_content", type=int, default=3)
     p.add_argument("--limit", type=int, default=None, help="stop after this many pairs in the manifest")
     p.add_argument("--stop_file", default=None)
+    p.add_argument("--ways", nargs="+", choices=["A", "B", "C"], default=["A", "B"])
+    p.add_argument("--base_lora", default=None, help="fine-tune of the transformer merged before sampling")
+    p.add_argument("--skip_split", default=None, help="split.json whose held-out references and photos are skipped")
     a = p.parse_args()
     out = Path(a.out)
     (out / "pairs").mkdir(parents=True, exist_ok=True)
@@ -62,6 +71,8 @@ def main():
     print(f"[data] {len(contents)} content photos, {len(refs)} references", flush=True)
 
     m = VibeModel(size=a.size)
+    if a.base_lora:
+        lora.merge(m.tr, lora.load(a.base_lora)[0])
     cap_path = out / "captions.json"
     captions = json.loads(cap_path.read_text(encoding="utf-8")) if cap_path.exists() else {}
     for r in refs:
@@ -75,6 +86,11 @@ def main():
     done = {json.loads(line)["pair"] for line in man_path.read_text(encoding="utf-8").splitlines()} if man_path.exists() else set()
     rng = random.Random(0)
     plan = [(c, r) for c in contents for r in rng.sample(refs, a.refs_per_content)]
+    if a.skip_split:
+        split = json.loads(Path(a.skip_split).read_text(encoding="utf-8"))
+        vr, vc = set(split["val_refs"]), set(split["val_contents"])
+        plan = [(c, r) for c, r in plan if f"{r.parent.name}/{r.stem}" not in vr and c.stem not in vc]
+        print(f"[data] {len(plan)} pairs outside the held-out split", flush=True)
     clip = CLIPScore()
     lat = a.size // 32
     t0, n_new = time.time(), 0
@@ -100,7 +116,10 @@ def main():
             scores = {}
             with torch.inference_mode():
                 il = m.encode([frame]).expand(a.seeds, -1, -1, -1)
-                embs = {"A": m.embed(caption, frame), "B": m.embed_with_reference(B_INSTRUCTION, frame, ref)}
+                make = {"A": lambda: m.embed(caption, frame),
+                        "B": lambda: m.embed_with_reference(REFERENCE_INSTRUCTION, frame, ref),
+                        "C": lambda: m.embed_with_reference(caption, frame, ref)}
+                embs = {w: make[w]() for w in a.ways}
                 fin, fref = clip._images([frame])[0], clip._images([np.asarray(ref)])[0]
                 base = float(fin @ fref)
                 for way, emb in embs.items():
@@ -117,7 +136,8 @@ def main():
                                                    input_sim=round(float(fo[s] @ fin), 4),
                                                    edge=round(edge_agreement(frame, img), 4))
             man.write(json.dumps(dict(pair=pair, content=str(c), ref=str(r), caption=caption, size=a.size,
-                                      steps=a.steps, seed0=seed0, scores=scores), ensure_ascii=False) + "\n")
+                                      steps=a.steps, seed0=seed0, base_lora=a.base_lora, scores=scores),
+                                 ensure_ascii=False) + "\n")
             man.flush()
             done.add(pair)
             n_new += 1

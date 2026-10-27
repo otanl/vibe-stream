@@ -33,6 +33,8 @@ STYLE_QUESTION = ("Write one instruction for an image editing model that restyle
                   "this artwork. Describe only the style (medium, technique, brushwork or linework, colour palette, "
                   "texture), not the subject or the scene, and do not name the artist or the work. Start with "
                   "'transfer this to' and use at most 40 words.")
+# The instruction that goes with a reference image handed to the encoder next to the frame (`embed_with_reference`).
+REFERENCE_INSTRUCTION = "transfer this to the artistic style of the second image"
 
 
 def add_vibe_to_path() -> None:

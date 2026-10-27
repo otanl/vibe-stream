@@ -5,10 +5,13 @@ the photo >= --min_input; a reference copied into the picture lowers both), chan
 the photo >= --min_change) and moved towards the reference (ref_gain >= --min_gain). CLIP similarity alone lets
 near-copies of the photo through when a colour shift raises ref_gain; LPIPS (AlexNet, 256 px) is computed on the GPU
 on the first run and cached in <data>/change.json. Among the qualifying candidates the one with the highest
-ref_gain + --w_edge * edge wins.
-Writes <data>/selected.jsonl (pair, content, ref, caption, target, way, scores), prints the yield and score
-distributions, and saves two contact sheets (photo | reference | target) of selected and of rejected pairs.
+ref_gain + --w_edge * edge wins. With --extra, the candidates of other data dirs over the same pairs (an earlier round,
+from the model before fine-tuning) compete as well; a pair present in only one dir keeps that dir's candidates.
+Writes <out>/selected.jsonl (pair, content, ref, caption, target, way, source, scores; --out defaults to --data),
+prints the yield and score distributions, and saves two contact sheets (photo | reference | target) of selected and of
+rejected pairs.
 Usage: python scripts/select_style_targets.py --data data/style_ft_768
+       python scripts/select_style_targets.py --data data/style_ft2_768 --extra data/style_ft_768
 """
 
 import argparse
@@ -78,14 +81,26 @@ def main():
     p.add_argument("--min_change", type=float, default=0.25, help="LPIPS to the photo; 0 skips it")
     p.add_argument("--w_edge", type=float, default=0.3)
     p.add_argument("--sheet", type=int, default=24, help="rows per contact sheet")
+    p.add_argument("--extra", nargs="*", default=[],
+                   help="further data dirs over the same pairs (e.g. an earlier round) whose candidates compete too")
+    p.add_argument("--out", default=None, help="directory for selected.jsonl and the sheets (default: --data)")
     a = p.parse_args()
     d = Path(a.data)
-    rows = [json.loads(line) for line in (d / "manifest.jsonl").read_text(encoding="utf-8").splitlines()]
-    if a.min_change > 0:
-        change = change_scores(d, rows)
+    out = Path(a.out) if a.out else d
+    out.mkdir(parents=True, exist_ok=True)
+    merged = {}  # pair -> manifest row; candidates of --extra dirs are labelled <dir name>/<key>
+    for src in [d] + [Path(x) for x in a.extra]:
+        rows = [json.loads(line) for line in (src / "manifest.jsonl").read_text(encoding="utf-8").splitlines()]
+        change = change_scores(src, rows) if a.min_change > 0 else None
         for r in rows:
+            row = merged.setdefault(r["pair"], dict(r, scores={}, paths={}))
             for k, s in r["scores"].items():
-                s["change"] = change[r["pair"]][k]
+                if change is not None:
+                    s["change"] = change[r["pair"]][k]
+                label = k if src == d else f"{src.name}/{k}"
+                row["scores"][label] = s
+                row["paths"][label] = str(src / "pairs" / r["pair"] / f"{k}.jpg")
+    rows = list(merged.values())
     sel, rej = [], []
     for r in rows:
         ok = {k: s for k, s in r["scores"].items() if s["edge"] >= a.min_edge and a.min_input <= s["input_sim"] <= a.max_input
@@ -95,14 +110,19 @@ def main():
             continue
         k = max(ok, key=lambda k: ok[k]["ref_gain"] + a.w_edge * ok[k]["edge"])
         sel.append(dict(pair=r["pair"], content=r["content"], ref=r["ref"], caption=r["caption"],
-                        target=str(d / "pairs" / r["pair"] / f"{k}.jpg"), way=k[0], scores=ok[k]))
-    with (d / "selected.jsonl").open("w", encoding="utf-8") as f:
+                        target=r["paths"][k], way=k.split("/")[-1][0], source=k.split("/")[0] if "/" in k else d.name,
+                        scores=ok[k]))
+    with (out / "selected.jsonl").open("w", encoding="utf-8") as f:
         for s in sel:
             f.write(json.dumps(s, ensure_ascii=False) + "\n")
 
     allc = [s for r in rows for s in r["scores"].values()]
+
+    def count(field):
+        return ", ".join(f"{v} {sum(s[field] == v for s in sel)}" for v in sorted({s[field] for s in sel}))
+
     print(f"[select] {len(sel)} of {len(rows)} pairs have a target ({100 * len(sel) / max(len(rows), 1):.0f} %); "
-          f"way A {sum(s['way'] == 'A' for s in sel)}, B {sum(s['way'] == 'B' for s in sel)}")
+          f"way {count('way')}" + (f"; from {count('source')}" if a.extra else ""))
     keys = ["ref_gain", "input_sim", "edge"] + (["change"] if a.min_change > 0 else [])
     for name, xs in (("all candidates", allc), ("selected", [s["scores"] for s in sel])):
         if xs:
@@ -138,13 +158,13 @@ def main():
             else:
                 k = max(it["scores"], key=lambda k: it["scores"][k]["ref_gain"])
                 s = it["scores"][k]
-                t.append(tile(cv2.imread(str(d / "pairs" / it["pair"] / f"{k}.jpg")),
+                t.append(tile(cv2.imread(it["paths"][k]),
                               f"{k} g{s['ref_gain']:.2f} in{s['input_sim']:.2f} e{s['edge']:.2f}"))
             lines.append(np.concatenate(t, 1))
         half = (len(lines) + 1) // 2
         cols = [np.concatenate(lines[:half], 0), np.concatenate(lines[half:] + [np.zeros_like(lines[0])] * (2 * half - len(lines)), 0)]
-        cv2.imwrite(str(d / f"sheet_{name}.jpg"), np.concatenate(cols, 1), [cv2.IMWRITE_JPEG_QUALITY, 88])
-    print(f"[select] wrote {d / 'selected.jsonl'} and sheets")
+        cv2.imwrite(str(out / f"sheet_{name}.jpg"), np.concatenate(cols, 1), [cv2.IMWRITE_JPEG_QUALITY, 88])
+    print(f"[select] wrote {out / 'selected.jsonl'} and sheets")
 
 
 if __name__ == "__main__":

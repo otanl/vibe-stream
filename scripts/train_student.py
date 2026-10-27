@@ -37,6 +37,10 @@ and --carry_lam (default lam) times an L1 against the warped output, weighted by
 of the stream. --carry_fill lut fills in where the flow fails with frame u through the colour map of frame t's input
 and 2-step output, as `Carry(fill="lut")` does with the keyframe batch.
 
+Teacher data with reference styles (make_teacher_data.py --style_list) has keys s0, s1, ... whose reference differs
+per window; --ref_min_edge leaves out the (window, key) pairs whose teacher repainted the scene or copied the
+reference's content, judged by the edge agreement of its first frame with the input (as select_style_targets.py).
+
 Recipe of the released 2-step student (runs/lam4_2step): --student_steps 2 --lam 4 --grad_ckpt, 1500 steps,
 about 8 GB and 2 s/step (56 min) on an RTX 3090 Ti. One step: drop --grad_ckpt (16.5 GB, 1.0 s/step).
 
@@ -58,6 +62,7 @@ from torch.utils.checkpoint import checkpoint
 import _paths  # noqa: F401
 from vibe_stream import lora
 from vibe_stream.carry import Carry, apply_colour_map, fit_colour_map, holds
+from vibe_stream.metrics import edge_agreement
 from vibe_stream.temporal_loss import masked_warp_l1, occlusion_mask, warp
 from vibe_stream.vibe_model import VibeModel, flow_step
 
@@ -95,6 +100,8 @@ def main():
     p.add_argument("--carry_fill", choices=["frame", "lut"], default="frame",
                    help="what fills in where the flow fails: the frame, or the frame through the colour map (carry.py)")
     p.add_argument("--init", default=None, help="start the student from this LoRA file (same rank and noise)")
+    p.add_argument("--ref_min_edge", type=float, default=None,
+                   help="leave out reference-style windows whose teacher output has less edge agreement with the input")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--log_every", type=int, default=50)
     p.add_argument("--no_save", action="store_true")
@@ -110,6 +117,12 @@ def main():
     data = [dict(np.load(f)) for f in sorted(Path(a.data).glob("w*.npz"))]
     keys = list(prompts)
     print(f"[train] {len(data)} windows x {len(keys)} prompts at {size}, {a.student_steps}-step student, lam {a.lam}", flush=True)
+    combos = None
+    if a.ref_min_edge is not None:
+        combos = [(d, k) for d in data for k in keys if f"ref_{k}" not in d
+                  or edge_agreement(d["frames"][0], d[f"timg_{k}"][0]) >= a.ref_min_edge]
+        print(f"[train] {len(combos)} of {len(data) * len(keys)} (window, prompt) pairs kept "
+              f"(reference styles with edge agreement >= {a.ref_min_edge})", flush=True)
 
     m = VibeModel(size=size, keep_text_encoder=False)
     m.vae.requires_grad_(False)
@@ -225,7 +238,10 @@ def main():
         return l_f
     t0 = time.perf_counter()
     for step in range(a.steps):
-        items = [(random.choice(data), random.choice(keys), random.randrange(nfr - 1)) for _ in range(a.pairs)]
+        if combos is None:
+            items = [(random.choice(data), random.choice(keys), random.randrange(nfr - 1)) for _ in range(a.pairs)]
+        else:
+            items = [(*random.choice(combos), random.randrange(nfr - 1)) for _ in range(a.pairs)]
         pick = [(d, k, t + j) for d, k, t in items for j in (0, 1)]
         img_lat = torch.from_numpy(np.stack([d["img_lat"][t] for d, _, t in pick])).to(dev)
         emb = torch.from_numpy(np.concatenate([d[f"emb_{k}"] for d, k, _ in pick])).to(dev, torch.bfloat16)
@@ -349,7 +365,7 @@ def main():
                                                      w_tex=a.w_tex, w_carry=a.w_carry,
                                                      carry_sigma=a.carry_sigma if a.w_carry > 0 else None,
                                                      carry_fill=a.carry_fill if a.w_carry > 0 else None,
-                                                     carry_lam=a.carry_lam, init=a.init))
+                                                     carry_lam=a.carry_lam, init=a.init, ref_min_edge=a.ref_min_edge))
     print(f"[train] saved {run / 'lora.safetensors'} after {time.perf_counter() - t0:.0f} s", flush=True)
 
 
