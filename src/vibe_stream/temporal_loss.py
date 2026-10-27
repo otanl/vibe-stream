@@ -24,6 +24,20 @@ def warp(img: torch.Tensor, flow: torch.Tensor):
     return F.grid_sample(img, grid, mode="bilinear", padding_mode="border", align_corners=True), inb
 
 
+def flow_grid(flow: torch.Tensor) -> torch.Tensor:
+    """The sampling grid `warp` builds for flow (B, H, W, 2), for warping several images along one flow
+    (`warp_grid`) without building it again."""
+    _, h, w, _ = flow.shape
+    ys, xs = torch.meshgrid(torch.arange(h, device=flow.device, dtype=torch.float32),
+                            torch.arange(w, device=flow.device, dtype=torch.float32), indexing="ij")
+    return torch.stack([(xs[None] + flow[..., 0]) / (w - 1) * 2 - 1, (ys[None] + flow[..., 1]) / (h - 1) * 2 - 1], -1)
+
+
+def warp_grid(img: torch.Tensor, grid: torch.Tensor) -> torch.Tensor:
+    """`warp` on a grid from `flow_grid` (the same values), without the in-bounds mask."""
+    return F.grid_sample(img, grid, mode="bilinear", padding_mode="border", align_corners=True)
+
+
 def occlusion_mask(in_a: torch.Tensor, in_b: torch.Tensor, flow: torch.Tensor, tau: float = 0.05) -> torch.Tensor:
     """(B, 1, H, W) weight for pairs of input frames in [0, 1]: in-bounds x photometric consistency of the flow."""
     wi, inb = warp(in_b, flow)

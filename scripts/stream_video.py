@@ -27,7 +27,8 @@ from vibe_stream.presets import PROMPTS
 from vibe_stream.stream import StreamEditor
 from vibe_stream.taesana import TinyAutoencoder
 from vibe_stream.temporal_filter import TemporalFilter
-from vibe_stream.vibe_model import VibeModel
+from vibe_stream.trt_tae import TRTTinyAutoencoder
+from vibe_stream.vibe_model import REFERENCE_INSTRUCTION, VibeModel
 
 
 def main():
@@ -37,9 +38,14 @@ def main():
     p.add_argument("--prompt", default="oil", help=f"an instruction, or a preset key: {', '.join(PROMPTS)}")
     p.add_argument("--style_image", default=None,
                    help="instead of --prompt: an image whose style VIBE's Qwen3-VL turns into the instruction")
+    p.add_argument("--style_way", choices=["text", "image", "both"], default="text",
+                   help="with --style_image: the instruction written from it, the image itself next to the frame, or "
+                        "both (as make_demo.py)")
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument("--engine", help="TensorRT engine from scripts/build_trt.py")
     g.add_argument("--student", help="student LoRA file (PyTorch bf16 path)")
+    p.add_argument("--tae_engine", default=None,
+                   help="taesana as TensorRT engines: the prefix given to scripts/build_trt_tae.py")
     p.add_argument("--batch", type=int, default=8, help="PyTorch path only; an engine fixes its batch")
     p.add_argument("--max_frames", type=int, default=None)
     p.add_argument("--loop_frames", type=int, default=None, help="cycle the clip to this many frames")
@@ -71,21 +77,29 @@ def main():
     frames = read_video_frames(a.input, size, a.max_frames)
     print(f"[input] {a.input}: {len(frames)} frames at {size}", flush=True)
     vibe = VibeModel(size=size)
+    reference = None
     if a.style_image:
-        prompt = vibe.style_prompt(Image.open(a.style_image).convert("RGB"))
-        print(f"[style] {a.style_image}: {prompt}", flush=True)
+        img = Image.open(a.style_image).convert("RGB")
+        if a.style_way == "image":
+            prompt = REFERENCE_INSTRUCTION
+        else:
+            prompt = vibe.style_prompt(img)
+            print(f"[style] {a.style_image}: {prompt}", flush=True)
+        reference = img if a.style_way != "text" else None
     if trained and prompt not in trained.values():
         print(f"[note] the student was trained on {list(trained.values())}; other instructions may come out weaker")
-    tae = TinyAutoencoder()
+    tae = TRTTinyAutoencoder(a.tae_engine) if a.tae_engine else TinyAutoencoder()
     tf = TemporalFilter(*a.temporal_filter) if a.temporal_filter else None
     ed = StreamEditor(vibe, tae, engine=engine, student=a.student, batch_size=a.batch, temporal_filter=tf,
                       carry=Carry(a.keyframe_every, sigma=a.carry_sigma, fill=a.carry_fill) if a.carry else None)
-    embed_ms = ed.set_prompt(prompt, frames[0])
+    embed_ms = ed.set_prompt(prompt, frames[0], reference)
     torch.cuda.reset_peak_memory_stats()
     run_frames = list(islice(cycle(frames), a.loop_frames)) if a.loop_frames else frames
     outs, tm = ed.run(run_frames, a.warmup_batches)
     outs = outs[:len(frames)]
-    backend = f"TensorRT {engine.spec.tensorrt}" if engine else "PyTorch bf16"
+    backend = f"TensorRT {engine.spec.tensorrt} {engine.spec.precision}" if engine else "PyTorch bf16"
+    if a.tae_engine:
+        backend += ", taesana TensorRT"
     if tf is not None:
         backend += f", temporal filter {tf.low:g}/{tf.high:g}"
     if ed.carry is not None:

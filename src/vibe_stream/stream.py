@@ -80,6 +80,10 @@ class StreamEditor:
             self.noise = state[lora_mod.NOISE_KEY].to(self.device, torch.float32)
             self.timesteps, self.sigmas = vibe.schedules[self.steps]
             self.prompts = meta.get("prompts", {})
+        tae_shape = (getattr(tae, "batch", self.batch_size), getattr(tae, "size", vibe.size))
+        if tae_shape != (self.batch_size, vibe.size):
+            raise ValueError(f"taesana engines built for batch {tae_shape[0]} at {tae_shape[1]}, "
+                             f"streaming batch {self.batch_size} at {vibe.size}")
         self.emb = None
         self.enc16 = None
         self.tfilter = temporal_filter
@@ -95,11 +99,13 @@ class StreamEditor:
         self.stream = torch.cuda.Stream(self.device)
 
     # ---------------------------------------------------------------- per clip
-    def set_prompt(self, prompt: str, frame: np.ndarray) -> float:
-        """Embed the instruction with this frame; returns the time it took in ms."""
+    def set_prompt(self, prompt: str, frame: np.ndarray, reference=None) -> float:
+        """Embed the instruction with this frame, and with a reference image after it if one is given
+        (`VibeModel.embed_with_reference`); returns the time it took in ms."""
         torch.cuda.synchronize()
         t0 = time.perf_counter()
-        self.emb = self.vibe.embed(prompt, frame)
+        self.emb = (self.vibe.embed(prompt, frame) if reference is None
+                    else self.vibe.embed_with_reference(prompt, frame, reference))
         for state in (self.tfilter, self.carry):
             if state is not None:
                 state.reset()

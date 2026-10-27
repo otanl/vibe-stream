@@ -26,7 +26,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from .temporal_loss import warp
+from .temporal_loss import flow_grid, warp_grid
 
 
 class TemporalFilter:
@@ -85,15 +85,20 @@ class TemporalFilter:
         fl_all, has = flows
         fl_all = F.interpolate(fl_all.permute(0, 3, 1, 2), size=(h, w), mode="bilinear", align_corners=False)
         fl_all = (fl_all * (h / self.flow_size)).permute(0, 2, 3, 1)
+        grid = flow_grid(fl_all)
+        # the occlusion weights of all frames at once: frame j's predecessor is frame j - 1 (frame 0's the previous
+        # batch's last); only the band blends are recursive
+        prev_in = torch.cat([x_in[:1] if self._prev_in is None else self._prev_in, x_in[:-1]])
+        m = torch.exp(-(x_in - warp_grid(prev_in, grid)).abs().mean(1, keepdim=True) / self.tau)
+        prev = None if self._prev_low is None else torch.cat([self._prev_low, self._prev_high], 1)
         shown = []
         for j in range(len(out)):
             lo, hi = low[j:j + 1], high[j:j + 1]
-            if has[j] and self._prev_low is not None:
-                fl = fl_all[j:j + 1]
-                wi, _ = warp(self._prev_in, fl)
-                m = torch.exp(-(x_in[j:j + 1] - wi).abs().mean(1, keepdim=True) / self.tau)
-                lo = m * self.low * warp(self._prev_low, fl)[0] + (1 - m * self.low) * lo
-                hi = m * self.high * warp(self._prev_high, fl)[0] + (1 - m * self.high) * hi
-            self._prev_in, self._prev_low, self._prev_high = x_in[j:j + 1], lo, hi
+            if has[j] and prev is not None:
+                wp, mj = warp_grid(prev, grid[j:j + 1]), m[j:j + 1]
+                lo = mj * self.low * wp[:, :3] + (1 - mj * self.low) * lo
+                hi = mj * self.high * wp[:, 3:] + (1 - mj * self.high) * hi
+            prev = torch.cat([lo, hi], 1)
             shown.append(lo + hi)
+        self._prev_in, self._prev_low, self._prev_high = x_in[-1:], prev[:, :3], prev[:, 3:]
         return torch.cat(shown).clamp(0, 255).round().to(torch.uint8).permute(0, 2, 3, 1).contiguous()

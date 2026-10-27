@@ -47,6 +47,7 @@ class EngineSpec:
     prompts: dict
     carry_sigma: Optional[float] = None   # the student's trained start of the carried step (vibe_stream.carry)
     carry_fill: Optional[str] = None      # and what it was trained to fill in with where the flow fails
+    precision: str = "fp16"               # or "int8" (vibe_stream.trt_int8)
 
     @staticmethod
     def path_for(engine) -> Path:
@@ -98,8 +99,11 @@ class _Graph(nn.Module):
                        t2i_samples=[False] * self.batch)[0]
 
 
-def export(model: VibeModel, student, engine, batch: int, img_lat: torch.Tensor, emb: torch.Tensor) -> None:
-    """Stage 1. `img_lat` (batch, 32, h, w) and `emb` (1, L, D) are real inputs for the check file.
+def export(model: VibeModel, student, engine, batch: int, img_lat: torch.Tensor, emb: torch.Tensor,
+           quantize=None) -> None:
+    """Stage 1. `img_lat` (batch, 32, h, w) and `emb` (1, L, D) are real inputs for the check file. `quantize`, if
+    given, takes the fp16 graph, the scaled timesteps and the sigmas and returns the quantized module to export
+    (`trt_int8`).
 
     Modifies `model.tr` in place (LoRA merged, projection removed, fp16); the model is not usable afterwards.
     """
@@ -136,6 +140,12 @@ def export(model: VibeModel, student, engine, batch: int, img_lat: torch.Tensor,
             v16 = graph(torch.cat([x, img_lat], 1).half(), enc16, tsc[i]).float()
             print(f"[export] step {i}: PyTorch fp16 vs bf16 velocity rel err {rel_err(v16, v):.4f}, "
                   f"finite {bool(torch.isfinite(v16).all())}", flush=True)
+    if quantize is not None:
+        graph = quantize(graph, [float(t[0]) for t in tsc], sg)
+        with torch.inference_mode():
+            for i, (x, v) in enumerate(zip(xs, vs)):
+                vq = graph(torch.cat([x, img_lat], 1).half(), enc16, tsc[i]).float()
+                print(f"[export] step {i}: quantized vs bf16 velocity rel err {rel_err(vq, v):.4f}", flush=True)
     check = {"enc": enc16, "il": img_lat.half()}
     for i, (x, v) in enumerate(zip(xs, vs)):
         check[f"x{i}"], check[f"v{i}"], check[f"t{i}"] = x, v, tsc[i]
@@ -147,27 +157,27 @@ def export(model: VibeModel, student, engine, batch: int, img_lat: torch.Tensor,
     EngineSpec(tensorrt="", platform="", size=model.size, batch=batch, student=str(student),
                student_sha256=sha256(student), student_steps=k, timesteps=[float(t[0]) for t in tsc], sigmas=sg,
                prompts=meta.get("prompts", {}), carry_sigma=meta.get("carry_sigma"),
-               carry_fill=meta.get("carry_fill")).save(engine)
+               carry_fill=meta.get("carry_fill"), precision="fp16" if quantize is None else "int8").save(engine)
     onnx = onnx_path(engine)
     onnx.parent.mkdir(parents=True, exist_ok=True)
     t0 = time.perf_counter()
-    with torch.inference_mode():
+    # Q/DQ in fp16 need opset 19; ModelOpt's quantizers export under no_grad, not inference mode
+    with torch.inference_mode() if quantize is None else torch.no_grad():
         torch.onnx.export(graph, (torch.cat([xs[0], img_lat], 1).half(), enc16, tsc[0]), str(onnx),
-                          input_names=["x", "enc", "t"], output_names=["v"], opset_version=17,
+                          input_names=["x", "enc", "t"], output_names=["v"], opset_version=17 if quantize is None else 19,
                           do_constant_folding=True, dynamo=False)
     print(f"[export] {onnx} written in {time.perf_counter() - t0:.0f} s", flush=True)
 
 
-def build(engine, workspace_gb: float = 6.0) -> None:
-    """Stage 2: strongly typed engine from the ONNX graph of stage 1."""
+def build_onnx(onnx, engine, workspace_gb: float = 6.0) -> str:
+    """A strongly typed engine from an ONNX graph; returns the TensorRT version."""
     import tensorrt as trt
     engine = Path(engine)
-    spec = EngineSpec.load(engine)
     log = trt.Logger(trt.Logger.WARNING)
     builder = trt.Builder(log)
     net = builder.create_network(1 << int(trt.NetworkDefinitionCreationFlag.STRONGLY_TYPED))
     parser = trt.OnnxParser(net, log)
-    if not parser.parse_from_file(str(onnx_path(engine))):
+    if not parser.parse_from_file(str(onnx)):
         raise RuntimeError("; ".join(str(parser.get_error(i)) for i in range(parser.num_errors)))
     cfg = builder.create_builder_config()
     cfg.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, int(workspace_gb * (1 << 30)))
@@ -176,10 +186,16 @@ def build(engine, workspace_gb: float = 6.0) -> None:
     if blob is None:
         raise RuntimeError("TensorRT build failed")
     engine.write_bytes(bytes(blob))
-    spec.tensorrt, spec.platform = trt.__version__, sys.platform
-    spec.save(engine)
     print(f"[build] {engine} {engine.stat().st_size / 2**30:.2f} GB in {time.perf_counter() - t0:.0f} s, "
           f"TensorRT {trt.__version__}", flush=True)
+    return trt.__version__
+
+
+def build(engine, workspace_gb: float = 6.0) -> None:
+    """Stage 2: strongly typed engine from the ONNX graph of stage 1."""
+    spec = EngineSpec.load(engine)
+    spec.tensorrt, spec.platform = build_onnx(onnx_path(engine), engine, workspace_gb), sys.platform
+    spec.save(engine)
 
 
 class TRTTransformer:

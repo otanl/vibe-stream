@@ -131,6 +131,46 @@ the engine of `lam4_carry_s05_lut_2step_640`, timed alternately with that of `la
 each; the machine was busier than for the numbers above, and the latter ran 28.6, 43.2 and 41.2), runs at 27.8, 41.3
 and 39.0: 3-5 % slower, of which 3 % already on the 2-step path, where the fill plays no part.
 
+**Faster: taesana in TensorRT and an INT8 transformer.** An Nsight Systems profile of the 768 carry-over + filter
+loop put over a third of the GPU time outside the transformer engine, most of it in taesana: in PyTorch its convolutions
+accumulate in fp32 (half rate on GeForce Ampere) and every ReLU, residual add and upsample is a kernel of its own.
+Three changes, each timed alternately against the one before (`stream_video.py`, `blackswan` cycled to 480 frames,
+`oil`, the engines of `lam4_carry_s05_lut_2step_768` / `_640`, loop fps, two rounds each):
+
+| Loop fps | 768, 2 steps | 768, carry-over + filter | 640, 2 steps | 640, carry-over + filter |
+|---|---:|---:|---:|---:|
+| taesana in PyTorch | 19.9 | 29.9 | 28.0 | 42.4 |
+| taesana as TensorRT engines (`--tae_engine`) | 22.2 | 37.5 | 31.5 | 50.9 |
+| + the filter's and the carry-over's warps batched | | 39.0 | | 52.8 |
+| + INT8 transformer engine (`build_trt.py --int8`) | 29.9 | 46.3 | 39.9 | 63.6 |
+
+- taesana as two strongly typed fp16 engines with the uint8 conversion and the layout changes inside
+  (`scripts/build_trt_tae.py`, `vibe_stream.trt_tae`): encode 0.63 to 0.27 and decode 8.73 to 3.68 ms per frame at
+  768 (0.50 to 0.21 and 6.02 to 2.43 at 640), decode 55 dB PSNR from PyTorch's; warping error, Sobel and edge
+  agreement of the output unchanged.
+- The temporal filter warps the whole batch's occlusion weights at once and both bands in one call per frame, the
+  carry-over its previous output and input in one call (`temporal_loss.flow_grid`): identical output, the filter
+  from 16.5 to 8.3 ms per batch of 8 at 768.
+- The INT8 engine (`vibe_stream.trt_int8`, NVIDIA ModelOpt; weights per channel, activations per tensor, static)
+  runs a step in 15.8 ms per frame at 768 against 21.2-22.0 for fp16 timed alternately (640: 12.2), and is 1.73 GB
+  against 2.98. Its velocity is within 2.8-4.9 % of bf16 PyTorch (fp16 engine: 1.2-1.7 %). Through the streaming
+  editor on the four evaluation clips x `oil` / `anime`, its output is at LPIPS 0.015 (2 steps) and 0.008
+  (carry-over + filter) from the fp16 engine's, with CLIP direction (0.208 / 0.198 against 0.209 / 0.198), flicker
+  (16.41 / 7.13 against 16.41 / 7.14) and warping error unchanged; side by side the frames are indistinguishable.
+  At 640: LPIPS 0.014 / 0.008, CLIP direction 0.201 / 0.195 for both, flicker 17.32 / 7.15 against 17.29 / 7.13.
+  What it took: ModelOpt's SmoothQuant smooths Linear layers only, and the feed-forward's 1x1 convolutions carry the
+  worst activation outliers (`conv_point` quantized alone: 12-19 % velocity error; all layers: 13-20 %), so
+  `trt_int8` smooths those too, folding the scale into the depthwise convolution before them where it can; the
+  depthwise convolutions, the cross-attention key / value projections and the embeddings stay fp16; Q/DQ are fp16
+  (with ModelOpt's fp32 default the layers between them ran in fp32). Calibration: 75 transformer calls as the
+  streaming editor makes them, from 10 training clips. Writing the 1x1 convolutions as Linear layers, to avoid
+  TensorRT's interleaved INT8 layout and its permutes, was slower and less accurate.
+
+After these, the transformer is 80 % of the loop's GPU time at 768. The profile also answered whether lifting
+GeForce Ampere's half-rate fp32 accumulation (e.g. with the gpu-unlock tool) would help: the engines already pick
+fp16-accumulating kernels, so it would have added 8-10 % to the loop before taesana moved to TensorRT and next to
+nothing after.
+
 ### Flicker (streaming path)
 
 `scripts/eval_flicker.py`: DAVIS `blackswan`, `parkour`, `dance-twirl`, `camel`, `goat` and `libby`, first 40 frames,
@@ -359,6 +399,29 @@ keyframes; every 2 batches adds little more. Starting the carried step from sigm
 holds a little more (0.076) for 6-10 % more flicker, without pulsing. Training the carried step on more styles is the
 open fix.
 
+**Fine-tuning the base model for the reference image.** To keep the image way's style without its content, VIBE
+itself was fine-tuned on its own selected outputs. Data (`make_style_data.py`): 2000 Open Images photos x 3 of 484
+public-domain references (475 from the Art Institute of Chicago, the nine above), 8-step candidates under the
+written instruction and under the reference image, two seeds each (4.3 h at 768); `select_style_targets.py` keeps
+the candidate with the highest reference gain among those that keep the photo's edges (edge agreement >= 0.25) and
+content (CLIP similarity to the photo 0.62-0.95), change it (LPIPS >= 0.25) and move towards the reference (gain >=
+0.05): 2947 of 6000 pairs. `train_style_ft.py`: a rank-32 LoRA on the transformer, flow matching, conditioned as at
+run time (instruction "transfer this to the artistic style of the second image" + reference image), 3000 steps (28
+min), 25 references held out (the nine famous works and 16 others). `eval_style_ft.py` on the 298 held-out pairs,
+8 steps, base -> fine-tuned: share of outputs passing all four criteria 0.24 -> 0.34 (famous works 0.16 -> 0.34),
+edge agreement 0.28 -> 0.40, reference gain 0.085 -> 0.066 (the copied content is gone: Beardsley's and Mucha's
+figures, Hokusai's wave in place of the subject); plain instructions barely move (LPIPS 0.12-0.21 to the base
+model's output, CLIP direction for `oil` 0.220 -> 0.209). The streaming student was then trained again with four
+references per window from the fine-tuned teacher besides `oil` and `anime` (`make_teacher_data.py --style_list
+--base_lora`, `train_student.py --ref_min_edge 0.25 --init` the LUT carry student, 1500 steps, 87 min):
+`refs_carry_s05_lut_2step_768`, as fast as before, with `oil` / `anime` kept (CLIP direction 0.209 / 0.176, filtered
+flicker 13.7 / 7.9 against 0.206 / 0.179 and 13.1 / 7.6). On six held-out famous works through the streaming path,
+the image way now gains about as much as before with fewer leaks, the written instruction gains at least as much on
+five of six, and both together (`--style_way both`: the written instruction with the reference image next to the
+frame) gain most, 0.075 against 0.071 (image) and 0.065 (instruction), and look the most balanced: Kandinsky as
+vivid as with the instruction, Hokusai's subject kept. The embedding has a fixed length, so the way costs nothing per
+frame. A second round of the same loop on the fine-tuned model's outputs did not help (Negative results).
+
 ## Setup
 
 The code expects an upstream VIBE checkout next to it (or `VIBE_REPO` pointing at one) and the weights in `models/`:
@@ -370,7 +433,9 @@ python scripts/download_weights.py                           # VIBE DistilledCFG
 
 Python 3.10 with torch (CUDA), transformers >= 4.57 (Qwen3-VL), diffusers, safetensors, huggingface_hub,
 opencv-python, lpips, and for the engine tensorrt 10.x and onnx (see `requirements.txt`). VIBE's own dependencies
-beyond these are not needed; when `loguru` is missing a silent stand-in is used.
+beyond these are not needed; when `loguru` is missing a silent stand-in is used. The INT8 engine also needs
+`nvidia-modelopt` (tested with 0.39.0; later releases require a newer torch than the one TensorRT 10.16 was used with
+here, 2.6).
 
 Video clips are not tracked; see [assets/README.md](assets/README.md).
 
@@ -382,6 +447,12 @@ python scripts/build_trt.py --student runs/lam4_2step/lora.safetensors \
     --engine out/trt/vibe_lam4_2step_768_b8.engine
 python scripts/stream_video.py --input assets/davis_mp4/blackswan.mp4 --prompt oil \
     --engine out/trt/vibe_lam4_2step_768_b8.engine --output out/stream/blackswan_oil.mp4 --compare
+# ... faster: taesana as TensorRT engines (once per size and batch) and the transformer in INT8
+python scripts/build_trt_tae.py --size 768 --prefix out/trt/taesana_768_b8
+python scripts/build_trt.py --student runs/lam4_2step/lora.safetensors \
+    --engine out/trt/vibe_lam4_2step_768_b8_int8.engine --int8
+python scripts/stream_video.py --input ... --engine out/trt/vibe_lam4_2step_768_b8_int8.engine \
+    --tae_engine out/trt/taesana_768_b8
 # ... or with PyTorch only
 python scripts/stream_video.py --input ... --student runs/lam4_2step/lora.safetensors
 # ... with the display-side temporal filter and / or the carry-over (any of these scripts, including make_demo.py);
@@ -413,13 +484,24 @@ python scripts/train_student.py --data data/teacher_640 --run runs/lam4_carry_s0
 python scripts/eval_flicker.py --student runs/lam4_carry_s05_lut_2step_640/lora.safetensors --carry \
     --out out/flicker/lam4_carry_s05_lut_2step_640_carry.json
 
-# Fine-tuning data for style from a reference image (work in progress): public-domain artworks from the Art Institute
+# Fine-tuning data for style from a reference image: public-domain artworks from the Art Institute
 # of Chicago API (CC0 images), Open Images validation photos listed as CC BY 2.0 (attribution kept in images.jsonl),
 # 8-step candidates under two ways of conditioning (~2.6 s per pair at 768), then one target per pair or none
 python scripts/fetch_style_refs.py --out data/style_refs_aic
 python scripts/fetch_content_images.py --out data/content_openimages --count 2000
 python scripts/make_style_data.py --content data/content_openimages --refs data/style_refs_aic --out data/style_ft_768
 python scripts/select_style_targets.py --data data/style_ft_768
+# ... fine-tune VIBE on the selected targets, score it on the held-out references, retrain the streaming student
+# with references from the fine-tuned teacher, stream with instruction + reference image
+python scripts/train_style_ft.py --data data/style_ft_768 --run runs/style_ft_b --cond B
+python scripts/eval_style_ft.py --data data/style_ft_768 --lora runs/style_ft_b/lora.safetensors --out out/style_ft/b --ways B C
+python scripts/make_teacher_data.py --out data/teacher_768_refs --style_list data/style_ft_768/student_refs.txt \
+    --base_lora runs/style_ft_b/lora.safetensors --reuse data/teacher_768
+python scripts/train_student.py --data data/teacher_768_refs --run runs/refs_carry_s05_lut_2step_768 --student_steps 2 \
+    --lam 4 --w_carry 1 --carry_sigma 0.5 --carry_fill lut --grad_ckpt --steps 1500 --ref_min_edge 0.25 \
+    --init runs/lam4_carry_s05_lut_2step_768/lora.safetensors
+python scripts/stream_video.py --input ... --engine out/trt/vibe_refs_carry_s05_lut_2step_768_b8.engine \
+    --style_image ref.jpg --style_way both --carry --temporal_filter 0.7 0.3
 ```
 
 A student is tied to its resolution and its init noise (stored in the file). Other instructions than the ones it was
@@ -436,6 +518,8 @@ a mismatch is refused.
   - `temporal_loss.py`: flow warp and the masked temporal term
   - `taesana.py`: the tiny autoencoder
   - `trt_engine.py`: ONNX export, engine build, runtime wrapper
+  - `trt_int8.py`: INT8 quantization of the transformer for its engine (ModelOpt)
+  - `trt_tae.py`: taesana as TensorRT engines
   - `stream.py`: batched, double-buffered streaming editor
   - `temporal_filter.py`: display-side two-band temporal filter
   - `carry.py`: carry-over of the previous output into the next batch's start
@@ -463,6 +547,25 @@ a mismatch is refused.
 
   DMD adds contrast and texture (Sobel) and flicker, but not the restyling a second step brings (sky, brush strokes
   on water); CLIP directional similarity does not move. One step's limit here is not the choice of loss.
+- **A second round of the base-model fine-tune on its own outputs.** Candidates from the fine-tuned model
+  (`make_style_data.py --base_lora --ways B C`, 5139 pairs; C = written instruction + reference image), selected
+  together with the first round's (`select_style_targets.py --extra`: 3949 pairs, 2493 of them new), fine-tuned
+  from the base again on the same held-out references and scored against the first round with the same pairs and
+  noise:
+
+  | Held-out pairs, 8 steps | Round 1 (B) | Round 2, B + C | Round 2, B |
+  |---|---:|---:|---:|
+  | Passing all criteria, reference image (famous works) | 0.34 (0.34) | 0.37 (0.41) | 0.37 (0.38) |
+  | Edge agreement | 0.40 | 0.47 | 0.46 |
+  | Reference gain (median) | 0.066 | 0.057 | 0.058 |
+  | CLIP direction, plain `oil` instruction (base 0.220) | 0.209 | 0.170 | 0.206 |
+
+  The second round keeps the photo's structure better and leaks less, but paints paler: its reference gain is above
+  the first round's on only a third of the pairs and its contrast lower on three quarters. Training on the reference
+  image alone (last column) removes the drift of the plain instruction, so that came from the B + C conditioning;
+  the paleness comes from the data. The new candidates have lower luminance contrast than the first round's targets
+  for the same pairs (73 %) at the same CLIP reference gain (median 0.098 against 0.094), which the CLIP criterion
+  does not see. The first round stays.
 - **Fine-tuning taesana's decoder towards VIBE's DC-AE** (sana-1.1). L1 + LPIPS + low-resolution MSE lowered LPIPS to
   the DC-AE decode (0.103) but visibly softened brush strokes (Sobel 6.2 vs DC-AE 8.0, released taesana 8.3). An
   adversarial version after TAESD's recipe (relativistic loss, replay buffer, R1/R2) was only slightly crisper at its

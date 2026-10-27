@@ -39,7 +39,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from .temporal_loss import warp
+from .temporal_loss import flow_grid, warp_grid
 
 
 def holds(cur: np.ndarray, ref: np.ndarray, flow: np.ndarray, tau: float) -> np.ndarray:
@@ -170,8 +170,8 @@ class Carry:
         fl = F.interpolate(flows.permute(0, 3, 1, 2), size=(h, w), mode="bilinear", align_corners=False) * (h / self.flow_size)
         fl = fl.permute(0, 2, 3, 1)
         n = len(inputs)
-        guess, _ = warp(self._ref_out.expand(n, -1, -1, -1), fl)
-        wi, _ = warp(self._ref_in.expand(n, -1, -1, -1), fl)
+        both = warp_grid(torch.cat([self._ref_out, self._ref_in], 1).expand(n, -1, -1, -1), flow_grid(fl))
+        guess, wi = both[:, :3], both[:, 3:]
         m = torch.exp(-(inputs.permute(0, 3, 1, 2).float() - wi).abs().mean(1, keepdim=True) / self.tau)
         guess = guess.clamp(0, 255).round().to(torch.uint8).permute(0, 2, 3, 1).contiguous()
         lut = apply_colour_map(self._cmap, inputs) if fill == "lut" and self._cmap is not None else None

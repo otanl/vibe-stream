@@ -26,7 +26,8 @@ from vibe_stream.presets import EVAL_CLIPS_DIR, PROMPTS
 from vibe_stream.stream import StreamEditor
 from vibe_stream.taesana import TinyAutoencoder
 from vibe_stream.temporal_filter import TemporalFilter
-from vibe_stream.vibe_model import ROOT, VibeModel
+from vibe_stream.trt_tae import TRTTinyAutoencoder
+from vibe_stream.vibe_model import REFERENCE_INSTRUCTION, ROOT, VibeModel
 
 
 def label(img: np.ndarray, text: str, bottom: bool = False) -> np.ndarray:
@@ -65,12 +66,20 @@ def main():
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument("--engine", help="TensorRT engine from scripts/build_trt.py")
     g.add_argument("--student", help="student LoRA file (PyTorch bf16 path)")
+    p.add_argument("--tae_engine", default=None,
+                   help="taesana as TensorRT engines: the prefix given to scripts/build_trt_tae.py")
     p.add_argument("--out", required=True)
     p.add_argument("--clips_dir", default=str(ROOT / EVAL_CLIPS_DIR))
     p.add_argument("--clips", nargs="*", default=None, help="clip names (default: every mp4 in --clips_dir)")
     p.add_argument("--prompts", nargs="*", default=None, help="preset keys (default: all, or none with --style_images)")
     p.add_argument("--style_images", nargs="*", default=[],
                    help="one panel per image, its style turned into the instruction by VIBE's Qwen3-VL")
+    p.add_argument("--style_way", choices=["text", "image", "both"], default="text",
+                   help="how --style_images condition: the instruction written from the image, the image itself "
+                        "next to the frame (copies its content unless the base is fine-tuned, --base_lora), or both")
+    p.add_argument("--base_lora", default=None,
+                   help="a fine-tune of the base model (scripts/train_style_ft.py), merged before the student; "
+                        "PyTorch path only")
     p.add_argument("--max_frames", type=int, default=None)
     p.add_argument("--temporal_filter", type=float, nargs=2, default=None, metavar=("LOW", "HIGH"),
                    help="display-side temporal filter (vibe_stream.temporal_filter), e.g. 0.7 0.3")
@@ -90,19 +99,32 @@ def main():
     if a.engine:
         from vibe_stream.trt_engine import TRTTransformer
         engine = TRTTransformer(a.engine)
-        size, backend = engine.spec.size, "TensorRT"
+        size, backend = engine.spec.size, "TensorRT" + (" INT8" if engine.spec.precision == "int8" else "")
     else:
         engine = None
         size, backend = int(lora.load(a.student)[1].get("size", 768)), "PyTorch"
     vibe = VibeModel(size=size)
+    if a.base_lora:
+        if engine is not None:
+            raise SystemExit("--base_lora needs the PyTorch path (--student); an engine has its weights built in")
+        lora.merge(vibe.tr, lora.load(a.base_lora)[0])
+        backend += " + style fine-tune"
     tf = TemporalFilter(*a.temporal_filter) if a.temporal_filter else None
-    ed = StreamEditor(vibe, TinyAutoencoder(), engine=engine, student=a.student, temporal_filter=tf,
+    tae = TRTTinyAutoencoder(a.tae_engine) if a.tae_engine else TinyAutoencoder()
+    ed = StreamEditor(vibe, tae, engine=engine, student=a.student, temporal_filter=tf,
                       carry=Carry(a.keyframe_every, sigma=a.carry_sigma, fill=a.carry_fill) if a.carry else None)
     instructions = {key: PROMPTS[key] for key in (a.prompts if a.prompts is not None else
                                                   [] if a.style_images else list(PROMPTS))}
+    references = {}
     for path in a.style_images:
-        instructions[Path(path).stem] = vibe.style_prompt(Image.open(path).convert("RGB"))
-        print(f"[style] {Path(path).stem}: {instructions[Path(path).stem]}", flush=True)
+        key, img = Path(path).stem, Image.open(path).convert("RGB")
+        if a.style_way == "image":
+            instructions[key], references[key] = REFERENCE_INSTRUCTION, img
+        else:
+            instructions[key] = vibe.style_prompt(img)
+            print(f"[style] {key}: {instructions[key]}", flush=True)
+            if a.style_way == "both":
+                references[key] = img
     clips = a.clips or sorted(f.stem for f in Path(a.clips_dir).glob("*.mp4"))
     gpu = torch.cuda.get_device_name().replace("NVIDIA ", "").replace("GeForce ", "")
     footer = f"{ed.steps}-step VIBE student, {size}px, {backend}, {gpu}"
@@ -118,7 +140,7 @@ def main():
         fps = video_fps(src)
         panels = [[label(label(f, f"input: {clip}"), footer, bottom=True) for f in frames]]
         for key, instruction in instructions.items():
-            ed.set_prompt(instruction, frames[0])
+            ed.set_prompt(instruction, frames[0], references.get(key))
             outs, tm = ed.run(frames, warmup_batches=1)
             panels.append([label(o, f"{key}: {tm.loop_fps:.0f} fps loop") for o in outs])
             print(f"[demo] {clip:<14} {key:<6} {len(frames)} frames, loop {tm.loop_fps:.1f} fps", flush=True)
