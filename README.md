@@ -14,21 +14,23 @@ streaming loop runs at 21.0 fps at 768 and 29.1 fps at 640 on an RTX 3090 Ti. A 
 previous output over into the next batch (one transformer call per frame) runs at 47.8 fps at 640 with less flicker
 and about the same edit strength; with the display filter on top, the flicker is half the 2-step path's at 44.1 fps
 at 640 and 31.1 fps at 768 ("Flicker"). One trained with a colour-mapped fill also keeps the 2-step path's colours,
-at the same speed at 768 and a few percent slower at 640. The numbers below say what has been measured and how.
+at the same speed at 768 and a few percent slower at 640. With taesana as TensorRT engines, the transformer as an INT8
+engine and its cross-attention K / V computed once per batch, that path (carry-over + filter) runs at 49.7 fps at 768
+and 67.4 fps at 640 ("Faster"). The numbers below say what has been measured and how.
 
 ## Demo
 
-https://github.com/user-attachments/assets/6db207d1-1b0c-45b7-a3dc-989f4862c664
+https://github.com/user-attachments/assets/c6173d79-383f-47d2-982b-764050744838
 
 Input | oil painting | anime on five DAVIS-2017 clips through the real-time path at 768 px on an RTX 3090 Ti: the
 student trained for the carry-over with the colour-mapped fill (`lam4_carry_s05_lut_2step_768`) with the transformer
-as a TensorRT engine, taesana, the carry-over and the temporal filter 0.7 / 0.3 (`scripts/make_demo.py --carry
---temporal_filter 0.7 0.3`; see "Flicker"). Each output panel shows the loop fps of its run: 30-31 fps on these short
-clips, 31.1 fps on the 480-frame loop (Speed).
+as an INT8 TensorRT engine, taesana as TensorRT engines, the carry-over and the temporal filter 0.7 / 0.3
+(`scripts/make_demo.py --tae_engine ... --carry --temporal_filter 0.7 0.3`; see "Flicker" and Speed, "Faster"). Each
+output panel shows the loop fps of its run: 48-50 fps on these short clips, 49.7 fps on the 480-frame loop.
 
-The same clips on the plain 2-step path at 768 (the released student, about twice the flicker; 20-21 fps):
+The same student and engine on the plain 2-step path (no carry-over, no filter: about twice the flicker; 30-32 fps):
 
-https://github.com/user-attachments/assets/4b1e7ff2-0bf6-47f0-80e7-4ec18ed29712
+https://github.com/user-attachments/assets/49b755a7-33bc-41a8-9291-0d36e390c07c
 
 Input clips: [DAVIS-2017](https://davischallenge.org/), see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
