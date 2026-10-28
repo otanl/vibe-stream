@@ -47,11 +47,22 @@ class TemporalFilter:
         self._prev_gray: Optional[np.ndarray] = None
         self._prev_in = self._prev_low = self._prev_high = None
 
-    def flows(self, frames: np.ndarray) -> Tuple[torch.Tensor, List[bool]]:
+    def host_flow(self, frame: np.ndarray) -> Optional[np.ndarray]:
+        """Host part of one frame, in order: its flow to the frame before it at flow_size (None for a clip's first
+        frame). `flows` calls it per frame; a live source can call it as each frame arrives (on another thread) and
+        hand the batch's results to `flows` instead."""
+        fs = self.flow_size
+        g = cv2.cvtColor(cv2.resize(frame, (fs, fs), interpolation=cv2.INTER_AREA), cv2.COLOR_RGB2GRAY)
+        fl = None if self._prev_gray is None else self.dis.calc(g, self._prev_gray, None)
+        self._prev_gray = g
+        return fl
+
+    def flows(self, frames: np.ndarray,
+              host: Optional[List[Optional[np.ndarray]]] = None) -> Tuple[torch.Tensor, List[bool]]:
         """Flows of a staged batch (B, H, W, 3) uint8: per frame the flow to the frame before it, computed on the host
-        at flow_size into pinned memory and copied to the GPU on the current stream without waiting for it. Returns
-        the (B, flow_size, flow_size, 2) GPU tensor and per frame whether it has a predecessor (not the first frame
-        of a clip)."""
+        at flow_size (or taken from `host`, the frames' `host_flow` results) into pinned memory and copied to the GPU
+        on the current stream without waiting for it. Returns the (B, flow_size, flow_size, 2) GPU tensor and per
+        frame whether it has a predecessor (not the first frame of a clip)."""
         fs = self.flow_size
         if not self._pinned or self._pinned[0].shape[0] != len(frames):
             self._pinned = [torch.zeros((len(frames), fs, fs, 2)).pin_memory() for _ in range(2)]
@@ -59,11 +70,10 @@ class TemporalFilter:
         self._copied[s].synchronize()                         # the copy from this buffer two batches ago is done
         buf, has = self._pinned[s].numpy(), []
         for j, f in enumerate(frames):
-            g = cv2.cvtColor(cv2.resize(f, (fs, fs), interpolation=cv2.INTER_AREA), cv2.COLOR_RGB2GRAY)
-            has.append(self._prev_gray is not None)
-            if has[-1]:
-                buf[j] = self.dis.calc(g, self._prev_gray, None)
-            self._prev_gray = g
+            fl = host[j] if host is not None else self.host_flow(f)
+            has.append(fl is not None)
+            if fl is not None:
+                buf[j] = fl
         out = self._pinned[s].to(self.device, non_blocking=True)
         self._copied[s].record()
         return out, has

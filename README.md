@@ -194,6 +194,32 @@ GeForce Ampere's half-rate fp32 accumulation (e.g. with the gpu-unlock tool) wou
 fp16-accumulating kernels, so it would have added 8-10 % to the loop before taesana moved to TensorRT and next to
 nothing after.
 
+**Delay with a live source.** Offline, a batch's host work (the DIS flows of the filter and the carry-over, about
+15 ms per frame at 768) overlaps the previous batch's GPU work. A live batch can only be staged once its last frame
+has arrived, and staged the same way that host work sat between the last frame and the GPU: 117 + 169 ms per batch
+of 8 at 768, more than the 267 ms a 30 fps camera leaves, so the delay grew without bound at every batch size.
+`vibe_stream.live.LiveEditor` computes each frame's flows on a thread as the frame arrives (`TemporalFilter.host_flow`,
+`Carry.host_flow`) and hands the batch to the GPU as soon as it is complete; with the batch-8 engines its output is
+identical to `StreamEditor.run`'s bit for bit. Delay from a frame's hand-over to its edited copy back on the host,
+`blackswan` handed over at 30 fps in wall-clock time (`scripts/measure_latency.py`), INT8 engines with carry-over +
+filter, mean / 95th percentile, two rounds:
+
+| Batch | 768: delay | 768: offline loop fps | 640: delay | 640: offline loop fps |
+|---|---:|---:|---:|---:|
+| 8 | 298 / 415 ms | 50.0 | 250 / 368 ms | 63.7 |
+| 4 | 150 / 201 ms | 46.3 | 128 / 178 ms | 53.5 |
+| 2 | 80 / 98 ms | 35.8 | 68 / 87 ms | 40.8 |
+| 1 | falls behind | 26 | | |
+
+A frame waits for the rest of its batch, up to (batch - 1) / 30 s, and then for the batch itself, so batch 2 is the
+shortest delay that still keeps up with 30 fps, and batch 4 keeps more headroom (46 fps at 768) for a busier GPU.
+Smaller batches carry the previous output over a shorter distance: warping error 9.93 / 9.57 / 9.57 at 768 and
+9.52 / 9.13 / 9.21 at 640 (batch 8 / 4 / 2), Sobel a little lower (8.98 / 8.90 / 8.82 and 9.21 / 8.98 / 8.95).
+The INT8 engines for batch 4 and 2 are not bit-reproducible from run to run (TensorRT's kernels for their smaller
+matrix products sum in a varying order: now and then one call differs by up to about 0.1 in velocity, which fades
+over the following batches); the batch-8 engines are. Checking this turned up a second source of run-to-run
+variation, now removed: the colour map of the LUT fill was summed with atomic adds (`Carry`'s `fit_colour_map`).
+
 ### Flicker (streaming path)
 
 `scripts/eval_flicker.py`: DAVIS `blackswan`, `parkour`, `dance-twirl`, `camel`, `goat` and `libby`, first 40 frames,
@@ -476,6 +502,12 @@ python scripts/build_trt.py --student runs/lam4_2step/lora.safetensors \
     --engine out/trt/vibe_lam4_2step_768_b8_int8.engine --int8
 python scripts/stream_video.py --input ... --engine out/trt/vibe_lam4_2step_768_b8_int8.engine \
     --tae_engine out/trt/taesana_768_b8
+# ... delay with a live source (frames handed over at 30 fps), here with engines for batch 2
+python scripts/build_trt_tae.py --size 768 --batch 2 --prefix out/trt/taesana_768_b2
+python scripts/build_trt.py --student runs/lam4_carry_s05_lut_2step_768/lora.safetensors \
+    --engine out/trt/vibe_lam4_carry_s05_lut_2step_768_b2_int8.engine --int8 --batch 2
+python scripts/measure_latency.py --engine out/trt/vibe_lam4_carry_s05_lut_2step_768_b2_int8.engine \
+    --tae_engine out/trt/taesana_768_b2 --carry --temporal_filter 0.7 0.3
 # ... or with PyTorch only
 python scripts/stream_video.py --input ... --student runs/lam4_2step/lora.safetensors
 # ... with the display-side temporal filter and / or the carry-over (any of these scripts, including make_demo.py);
@@ -547,6 +579,7 @@ a mismatch is refused.
   - `trt_int8.py`: INT8 quantization of the transformer for its engine (ModelOpt)
   - `trt_tae.py`: taesana as TensorRT engines
   - `stream.py`: batched, double-buffered streaming editor
+  - `live.py`: the same for frames arriving one at a time, host flows computed as they arrive
   - `temporal_filter.py`: display-side two-band temporal filter
   - `carry.py`: carry-over of the previous output into the next batch's start
   - `metrics.py`: video I/O, warping error, flicker split, Sobel, edge agreement, LPIPS, CLIP scores

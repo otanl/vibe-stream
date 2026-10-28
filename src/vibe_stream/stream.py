@@ -8,7 +8,8 @@ transformer in bf16 with the student merged.
 An optional `temporal_filter.TemporalFilter` blends each decoded batch with the previously shown frames along the
 input's optical flow; its flows are computed on the host while the GPU works on the previous batch. An optional
 `carry.Carry` starts each batch after a keyframe from the previous batch's output (one transformer call instead of
-k); its flows are computed the same way.
+k); its flows are computed the same way. For a live source, where a batch exists only once its last frame has
+arrived, `live.LiveEditor` computes them as the frames arrive instead.
 
 Throughput figures, defined as in dreamlite-stream:
   step-only  GPU time of `edit` (CUDA events) on uint8 frames already on the GPU.
@@ -163,6 +164,18 @@ class StreamEditor:
         return self.tae.decode_u8(x)
 
     @torch.inference_mode()
+    def process(self, frames: torch.Tensor, flows=None, plan=None) -> torch.Tensor:
+        """GPU side of one staged batch: `edit` (carried when `plan` is given), the carry-over's bookkeeping and the
+        temporal filter. `flows` / `plan` come from the batch's `TemporalFilter.flows` / `Carry.plan`."""
+        fill = self.carry_fill()
+        out = self.edit(frames, None if plan is None else self.carry.start(frames, plan, self.noise.shape[-1], fill))
+        if self.carry is not None:
+            self.carry.update(frames, out, fill)
+        if self.tfilter is not None:
+            out = self.tfilter(frames, out, flows)
+        return out
+
+    @torch.inference_mode()
     def run(self, frames: Sequence[np.ndarray], warmup_batches: int = 2) -> tuple[List[np.ndarray], RunTiming]:
         """Edit a list of RGB uint8 frames in batches; a short last batch is padded with its last frame.
 
@@ -212,12 +225,7 @@ class StreamEditor:
             plan = self.carry.plan(arr) if self.carry is not None else None
             gpu = pin_in[s].to(self.device, non_blocking=True)
             ev0[s].record()
-            fill = self.carry_fill()
-            out = self.edit(gpu, None if plan is None else self.carry.start(gpu, plan, self.noise.shape[-1], fill))
-            if self.carry is not None:
-                self.carry.update(gpu, out, fill)
-            if self.tfilter is not None:
-                out = self.tfilter(gpu, out, flows)
+            out = self.process(gpu, flows, plan)
             ev1[s].record()
             pin_out[s].copy_(out, non_blocking=True)
             done[s].record()

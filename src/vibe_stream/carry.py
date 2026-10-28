@@ -85,8 +85,11 @@ def fit_colour_map(inputs: torch.Tensor, outputs: torch.Tensor, bins: int = 16, 
     idx = (a * (bins / 256)).long().clamp(0, bins - 1)
     flat = ((idx[:, 0] * bins + idx[:, 1]) * bins + idx[:, 2]).reshape(-1)
     d = (b - a).permute(1, 0, 2, 3).reshape(3, -1)
-    sums = torch.zeros(3, bins ** 3, device=a.device).index_add_(1, flat, d)
-    cnt = torch.zeros(1, bins ** 3, device=a.device).index_add_(1, flat, torch.ones(1, flat.numel(), device=a.device))
+    # index_put_ with accumulate sorts by index, so the sums come out the same every run; index_add_ adds with atomics
+    # in a varying order, and the last-digit differences grew to visible ones through the fill
+    rows = torch.arange(3, device=a.device)[:, None].expand(3, flat.numel())
+    sums = torch.zeros(3, bins ** 3, device=a.device).index_put_((rows, flat.expand(3, -1)), d, accumulate=True)
+    cnt = torch.bincount(flat, minlength=bins ** 3).float().view(1, -1)
     sums = _blur_grid(sums.view(3, bins, bins, bins), sigma_bin)
     cnt = _blur_grid(cnt.view(1, bins, bins, bins), sigma_bin)
     return (sums + prior * d.mean(1).view(3, 1, 1, 1)) / (cnt + prior)
@@ -133,11 +136,26 @@ class Carry:
         h, w = cur.shape[:2]
         return cv2.resize(fl, (w, h), interpolation=cv2.INTER_LINEAR) * (w / size)
 
-    def plan(self, frames: np.ndarray):
-        """Host side of a staged batch (B, H, W, 3) uint8. Returns None for a keyframe batch, else the flows of its
-        frames to the reference frame on the GPU (B, flow_size, flow_size, 2), copied from pinned memory."""
+    def gray(self, frame: np.ndarray) -> np.ndarray:
         fs = self.flow_size
-        grays = [cv2.cvtColor(cv2.resize(f, (fs, fs), interpolation=cv2.INTER_AREA), cv2.COLOR_RGB2GRAY) for f in frames]
+        return cv2.cvtColor(cv2.resize(frame, (fs, fs), interpolation=cv2.INTER_AREA), cv2.COLOR_RGB2GRAY)
+
+    def host_flow(self, gray: np.ndarray, ref: Optional[np.ndarray]):
+        """Host part of one frame (its `gray`) against the reference, the gray of the previous batch's last frame
+        (None for a clip's first batch): (flow at flow_size, whether it holds), or None without a reference. `plan`
+        calls it per frame; a live source, which knows the reference once the previous batch is complete, can call it
+        as each frame arrives (on another thread) and hand the batch's grays and results to `plan` instead."""
+        if ref is None:
+            return None
+        fl = self.dis.calc(gray, ref, None)
+        return fl, holds(gray, ref, fl, self.tau).mean() >= self.cut_below
+
+    def plan(self, frames: np.ndarray, host=None):
+        """Host side of a staged batch (B, H, W, 3) uint8. Returns None for a keyframe batch, else the flows of its
+        frames to the reference frame on the GPU (B, flow_size, flow_size, 2), copied from pinned memory. `host`:
+        the frames' (grays, `host_flow` results), computed ahead."""
+        fs = self.flow_size
+        grays = host[0] if host is not None else [self.gray(f) for f in frames]
         ref, self._ref_gray = self._ref_gray, grays[-1]
         key = ref is None or (self.keyframe_every > 0 and self._since_key >= self.keyframe_every)
         if not key:
@@ -147,8 +165,8 @@ class Carry:
             self._copied[s].synchronize()
             buf = self._pinned[s].numpy()
             for j, g in enumerate(grays):
-                buf[j] = self.dis.calc(g, ref, None)
-                if holds(g, ref, buf[j], self.tau).mean() < self.cut_below:
+                buf[j], ok = host[1][j] if host is not None else self.host_flow(g, ref)
+                if not ok:
                     key = True
                     break
         self._was_key = key
