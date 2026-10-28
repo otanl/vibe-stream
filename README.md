@@ -134,8 +134,8 @@ and 39.0: 3-5 % slower, of which 3 % already on the 2-step path, where the fill 
 **Faster: taesana in TensorRT and an INT8 transformer.** An Nsight Systems profile of the 768 carry-over + filter
 loop put over a third of the GPU time outside the transformer engine, most of it in taesana: in PyTorch its convolutions
 accumulate in fp32 (half rate on GeForce Ampere) and every ReLU, residual add and upsample is a kernel of its own.
-Three changes, each timed alternately against the one before (`stream_video.py`, `blackswan` cycled to 480 frames,
-`oil`, the engines of `lam4_carry_s05_lut_2step_768` / `_640`, loop fps, two rounds each):
+Four changes, each timed alternately against the one before (`stream_video.py`, `blackswan` cycled to 480 frames,
+`oil`, the engines of `lam4_carry_s05_lut_2step_768` / `_640`, loop fps, two to five rounds each):
 
 | Loop fps | 768, 2 steps | 768, carry-over + filter | 640, 2 steps | 640, carry-over + filter |
 |---|---:|---:|---:|---:|
@@ -143,6 +143,7 @@ Three changes, each timed alternately against the one before (`stream_video.py`,
 | taesana as TensorRT engines (`--tae_engine`) | 22.2 | 37.5 | 31.5 | 50.9 |
 | + the filter's and the carry-over's warps batched | | 39.0 | | 52.8 |
 | + INT8 transformer engine (`build_trt.py --int8`) | 29.9 | 46.3 | 39.9 | 63.6 |
+| + cross-attention K / V once per call, not per frame | 31.0 | 49.7 | 43.0 | 67.4 |
 
 - taesana as two strongly typed fp16 engines with the uint8 conversion and the layout changes inside
   (`scripts/build_trt_tae.py`, `vibe_stream.trt_tae`): encode 0.63 to 0.27 and decode 8.73 to 3.68 ms per frame at
@@ -165,7 +166,7 @@ Three changes, each timed alternately against the one before (`stream_video.py`,
   engine 0.013 / 0.008 (2 steps / carry-over + filter) for the instructions and 0.020 / 0.012 for the references;
   CLIP direction 0.211 / 0.200 against 0.210 / 0.199, CLIP similarity gain to the reference 0.149 / 0.116 against
   0.151 / 0.116, flicker and warping error unchanged. Loop fps with Van Gogh's *Starry Night* as the reference (same
-  setup as the table, two rounds): image way 21.7-22.8 to 27.9-29.6 (2 steps) and 36.3-38.2 to 44.6-47.2 (carry-over
+  setup as the table, two rounds, before the cross-attention change below): image way 21.7-22.8 to 27.9-29.6 (2 steps) and 36.3-38.2 to 44.6-47.2 (carry-over
   + filter); `--style_way both` runs as fast as the image way (36.3-38.2 to 44.5-44.6).
   What it took: ModelOpt's SmoothQuant smooths Linear layers only, and the feed-forward's 1x1 convolutions carry the
   worst activation outliers (`conv_point` quantized alone: 12-19 % velocity error; all layers: 13-20 %), so
@@ -174,6 +175,17 @@ Three changes, each timed alternately against the one before (`stream_video.py`,
   (with ModelOpt's fp32 default the layers between them ran in fp32). Calibration: 75 transformer calls as the
   streaming editor makes them, from 10 training clips. Writing the 1x1 convolutions as Linear layers, to avoid
   TensorRT's interleaved INT8 layout and its permutes, was slower and less accurate.
+- Every frame of a batch carries the same instruction, yet each of the 20 cross-attention layers projected the
+  224-token context to K / V once per frame, in fp16 even in the INT8 engine. Engines are now exported with K / V
+  projected from the first row only and the batch's queries attending to them as one sequence
+  (`trt_engine.SharedContextAttnProcessor`). Exact: the PyTorch fp16 velocity's error to bf16 is unchanged to four
+  digits. A step takes 18.7-19.1 instead of 21.3-21.5 ms per frame at 768 with the fp16 engine (640: 14.0 instead of
+  16.0-16.1) and 14.8-15.0 instead of 15.7-16.1 with INT8 (640: 11.1-11.2 instead of 12.0-12.1), timed alternately.
+  In the same loop runs the INT8 engines without it ran 29.1-29.5, 47.3-47.5, 39.4-39.9 and 61.3-64.1 fps. The new
+  INT8 engine's velocity is within 2.8 / 5.2 % of bf16, and its output is at LPIPS 0.016 / 0.008 from the fp16
+  engine's (before: 0.015 / 0.008), CLIP direction 0.209 / 0.198 and flicker 16.52 / 7.18 against 16.41 / 7.14.
+  Engines built before keep working (`EngineSpec.shared_context` false); one built with it reads only the first row
+  of its context input.
 
 After these, the transformer is 80 % of the loop's GPU time at 768. The profile also answered whether lifting
 GeForce Ampere's half-rate fp32 accumulation (e.g. with the gpu-unlock tool) would help: the engines already pick

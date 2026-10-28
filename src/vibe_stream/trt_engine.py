@@ -11,8 +11,11 @@ records them together with the student it was built from (and the student's `car
 `StreamEditor`), and `TRTTransformer` refuses a mismatch. The student's init noise is stored next to the engine
 (`<engine>.noise.safetensors`), so the engine alone is enough to run.
 
+The cross-attention projects its K / V from the context once per call, not once per frame
+(`SharedContextAttnProcessor`): the streaming editor gives every frame of a batch the same instruction.
+
 Measured on an RTX 3090 Ti with TensorRT 10.16 at 768, batch 8: 2.98 GB engine built in 100 s, velocity within
-1.3-2.0 % of bf16 PyTorch, 20.8 ms per frame per step (bf16 PyTorch eager: 36 ms).
+1.3-2.0 % of bf16 PyTorch, 18.8 ms per frame per step (21.3 with K / V per frame; bf16 PyTorch eager: 36 ms).
 """
 
 from __future__ import annotations
@@ -48,6 +51,7 @@ class EngineSpec:
     carry_sigma: Optional[float] = None   # the student's trained start of the carried step (vibe_stream.carry)
     carry_fill: Optional[str] = None      # and what it was trained to fill in with where the flow fails
     precision: str = "fp16"               # or "int8" (vibe_stream.trt_int8)
+    shared_context: bool = False          # cross-attention K / V from the first row only (SharedContextAttnProcessor)
 
     @staticmethod
     def path_for(engine) -> Path:
@@ -84,6 +88,33 @@ def sha256(path) -> str:
 
 def rel_err(a: torch.Tensor, b: torch.Tensor) -> float:
     return ((a.float() - b.float()).norm() / b.float().norm()).item()
+
+
+class SharedContextAttnProcessor:
+    """Sana's cross-attention (diffusers' SanaAttnProcessor2_0, no mask) for a batch whose rows share one context, as
+    in the streaming editor (one instruction per clip): K / V are projected from the first row only, and the batch's
+    queries attend to them as one sequence, so the 20 layers' K / V projections run once per call instead of once per
+    frame. Exact up to fp16 rounding; an engine exported with it ignores every row of `enc` but the first.
+    """
+
+    def __call__(self, attn, hidden_states, encoder_hidden_states=None, attention_mask=None):
+        if encoder_hidden_states is None or attention_mask is not None:
+            raise ValueError("cross-attention without a mask expected")
+        b, n, _ = hidden_states.shape
+        ctx = encoder_hidden_states[:1]
+        query, key, value = attn.to_q(hidden_states), attn.to_k(ctx), attn.to_v(ctx)
+        if attn.norm_q is not None:
+            query = attn.norm_q(query)
+        if attn.norm_k is not None:
+            key = attn.norm_k(key)
+        h = attn.heads
+        d = key.shape[-1] // h
+        query = query.view(b, n, h, d).permute(2, 0, 1, 3).reshape(1, h, b * n, d)
+        key = key.view(1, -1, h, d).transpose(1, 2)
+        value = value.view(1, -1, h, d).transpose(1, 2)
+        out = torch.nn.functional.scaled_dot_product_attention(query, key, value)
+        out = out.view(h, b, n, d).permute(1, 2, 0, 3).reshape(b, n, h * d).to(query.dtype)
+        return attn.to_out[1](attn.to_out[0](out)) / attn.rescale_output_factor
 
 
 class _Graph(nn.Module):
@@ -132,6 +163,8 @@ def export(model: VibeModel, student, engine, batch: int, img_lat: torch.Tensor,
     tr = model.tr
     tr.caption_projection, tr.caption_norm = nn.Identity(), nn.Identity()
     tr.half()
+    for block in tr.transformer_blocks:
+        block.attn2.set_processor(SharedContextAttnProcessor())
     graph = _Graph(tr, batch).eval()
     enc16 = enc.half().expand(batch, -1, -1).contiguous()
     tsc = [(t.float().expand(batch) * model.tscale).contiguous() for t in ts]
@@ -157,7 +190,8 @@ def export(model: VibeModel, student, engine, batch: int, img_lat: torch.Tensor,
     EngineSpec(tensorrt="", platform="", size=model.size, batch=batch, student=str(student),
                student_sha256=sha256(student), student_steps=k, timesteps=[float(t[0]) for t in tsc], sigmas=sg,
                prompts=meta.get("prompts", {}), carry_sigma=meta.get("carry_sigma"),
-               carry_fill=meta.get("carry_fill"), precision="fp16" if quantize is None else "int8").save(engine)
+               carry_fill=meta.get("carry_fill"), precision="fp16" if quantize is None else "int8",
+               shared_context=True).save(engine)
     onnx = onnx_path(engine)
     onnx.parent.mkdir(parents=True, exist_ok=True)
     t0 = time.perf_counter()
