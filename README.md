@@ -158,6 +158,15 @@ Three changes, each timed alternately against the one before (`stream_video.py`,
   (carry-over + filter) from the fp16 engine's, with CLIP direction (0.208 / 0.198 against 0.209 / 0.198), flicker
   (16.41 / 7.13 against 16.41 / 7.14) and warping error unchanged; side by side the frames are indistinguishable.
   At 640: LPIPS 0.014 / 0.008, CLIP direction 0.201 / 0.195 for both, flicker 17.32 / 7.15 against 17.29 / 7.13.
+  The reference-style student `refs_carry_s05_lut_2step_768` (Results, "Other instructions and style from a
+  reference image") is calibrated on its reference prompts with 40 of its training references handed to the encoder
+  (`--calib_refs`; the prompts' text would be meaningless to it). Velocity within 2.6-4.7 % of bf16, 16.0 ms per
+  frame per step. On the four clips x `oil` / `anime` and x four held-out references (image way): LPIPS to the fp16
+  engine 0.013 / 0.008 (2 steps / carry-over + filter) for the instructions and 0.020 / 0.012 for the references;
+  CLIP direction 0.211 / 0.200 against 0.210 / 0.199, CLIP similarity gain to the reference 0.149 / 0.116 against
+  0.151 / 0.116, flicker and warping error unchanged. Loop fps with Van Gogh's *Starry Night* as the reference (same
+  setup as the table, two rounds): image way 21.7-22.8 to 27.9-29.6 (2 steps) and 36.3-38.2 to 44.6-47.2 (carry-over
+  + filter); `--style_way both` runs as fast as the image way (36.3-38.2 to 44.5-44.6).
   What it took: ModelOpt's SmoothQuant smooths Linear layers only, and the feed-forward's 1x1 convolutions carry the
   worst activation outliers (`conv_point` quantized alone: 12-19 % velocity error; all layers: 13-20 %), so
   `trt_int8` smooths those too, folding the scale into the depthwise convolution before them where it can; the
@@ -502,6 +511,9 @@ python scripts/train_student.py --data data/teacher_768_refs --run runs/refs_car
     --init runs/lam4_carry_s05_lut_2step_768/lora.safetensors
 python scripts/stream_video.py --input ... --engine out/trt/vibe_refs_carry_s05_lut_2step_768_b8.engine \
     --style_image ref.jpg --style_way both --carry --temporal_filter 0.7 0.3
+# ... its INT8 engine: the reference prompts are calibrated on reference images (--calib_refs, by default the list above)
+python scripts/build_trt.py --student runs/refs_carry_s05_lut_2step_768/lora.safetensors \
+    --engine out/trt/vibe_refs_carry_s05_lut_2step_768_b8_int8.engine --int8
 ```
 
 A student is tied to its resolution and its init noise (stored in the file). Other instructions than the ones it was

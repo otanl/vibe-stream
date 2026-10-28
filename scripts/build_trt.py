@@ -6,7 +6,8 @@
   all     the three in order, each in its own process (the default)
 
 --int8 quantizes the transformer (vibe_stream.trt_int8; needs nvidia-modelopt), calibrated on --calib_clips training
-clips.
+clips with the student's prompts. A student with reference styles (make_teacher_data.py --style_list) is calibrated
+on its reference prompts with real reference images from --calib_refs, not on their text.
 
 Usage: python scripts/build_trt.py --student runs/lam4_2step/lora.safetensors --engine out/trt/vibe_lam4_2step_768_b8.engine
        python scripts/build_trt.py --student ... --engine out/trt/vibe_lam4_2step_768_b8_int8.engine --int8
@@ -23,7 +24,9 @@ import _paths  # noqa: F401
 from vibe_stream import lora, trt_engine
 from vibe_stream.metrics import read_video_frames
 from vibe_stream.presets import EVAL_CLIPS_DIR, PROMPTS, TRAIN_CLIPS_DIR
-from vibe_stream.vibe_model import ROOT, VibeModel
+from vibe_stream.vibe_model import REFERENCE_INSTRUCTION, ROOT, VibeModel
+
+REFERENCE_PROMPT = "reference image to the encoder"   # how make_teacher_data.py describes a reference style
 
 
 def export(a):
@@ -38,14 +41,26 @@ def export(a):
     emb = m.embed(prompts[0], frames[0])
     quantize = None
     if a.int8:
+        from PIL import Image
         from vibe_stream.taesana import TinyAutoencoder
         tae = TinyAutoencoder()
+        text = [p for p in prompts if not p.startswith(REFERENCE_PROMPT)]
+        n_ref = len(prompts) - len(text)
+        refs = []
+        if n_ref:
+            listed = [x.strip() for x in (ROOT / a.calib_refs).read_text(encoding="utf-8").splitlines() if x.strip()]
+            refs = [listed[int(k)] for k in np.linspace(0, len(listed) - 1, a.calib_clips * n_ref)]
+            print(f"[export] {n_ref} reference prompts, calibrated with {len(refs)} images from {a.calib_refs}",
+                  flush=True)
         calib = []   # (taesana latents of the frames, raw embedding); projected inside `quantize`, after the merge
         with torch.inference_mode():
             for i, fr in enumerate(trt_int8.calibration_frames(ROOT / TRAIN_CLIPS_DIR, size, a.batch, a.calib_clips)):
                 il = tae.encode_u8(torch.from_numpy(np.stack(fr)).to(m.device))
                 extra = [trt_int8.EXTRA_PROMPTS[(i // 2) % 2]] if i % 2 == 0 else []
-                calib += [(il, m.embed(p, fr[0])) for p in prompts + extra]
+                calib += [(il, m.embed(p, fr[0])) for p in text + extra]
+                for j in range(n_ref):
+                    ref = Image.open(refs[(i * n_ref + j) % len(refs)]).convert("RGB")
+                    calib.append((il, m.embed_with_reference(REFERENCE_INSTRUCTION, fr[0], ref)))
 
         def quantize(graph, timesteps, sigmas):
             with torch.inference_mode():
@@ -82,6 +97,8 @@ def main():
     p.add_argument("--workspace_gb", type=float, default=6.0)
     p.add_argument("--int8", action="store_true", help="INT8 transformer (vibe_stream.trt_int8)")
     p.add_argument("--calib_clips", type=int, default=10, help="with --int8: training clips to calibrate on")
+    p.add_argument("--calib_refs", default="data/style_ft_768/student_refs.txt",
+                   help="with --int8, for a student with reference styles: reference images, one path per line")
     a = p.parse_args()
     if a.stage == "all":
         rest = [x for x in sys.argv[1:] if x != "all"]
