@@ -44,6 +44,9 @@ reference's content, judged by the edge agreement of its first frame with the in
 Recipe of the released 2-step student (runs/lam4_2step): --student_steps 2 --lam 4 --grad_ckpt, 1500 steps,
 about 8 GB and 2 s/step (56 min) on an RTX 3090 Ti. One step: drop --grad_ckpt (16.5 GB, 1.0 s/step).
 
+--data takes several teacher dirs with the same prompts (e.g. windows at two frame strides). Above 8 GB of windows
+the teacher images, the bulk with many prompts, are read from disk at each use instead of being held in memory.
+
 Usage: python scripts/train_student.py --data data/teacher_768 --run runs/lam4_2step --student_steps 2 --lam 4 --grad_ckpt
 """
 import argparse
@@ -67,9 +70,27 @@ from vibe_stream.temporal_loss import masked_warp_l1, occlusion_mask, warp
 from vibe_stream.vibe_model import VibeModel, flow_step
 
 
+class LazyWindow:
+    """A teacher window whose teacher images are read from disk at each use; the other arrays are kept once read."""
+
+    def __init__(self, path):
+        self.z = np.load(path)
+        self.cache = {}
+
+    def __contains__(self, key):
+        return key in self.z.files
+
+    def __getitem__(self, key):
+        if key.startswith("timg_"):
+            return self.z[key]
+        if key not in self.cache:
+            self.cache[key] = self.z[key]
+        return self.cache[key]
+
+
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--data", required=True)
+    p.add_argument("--data", required=True, nargs="+", help="teacher dirs (make_teacher_data.py) with the same prompts")
     p.add_argument("--run", required=True)
     p.add_argument("--student_steps", type=int, default=2, choices=[1, 2])
     p.add_argument("--lam", type=float, default=4.0, help="weight of the temporal term (0: plain distillation)")
@@ -112,9 +133,18 @@ def main():
     run = Path(a.run)
     run.mkdir(parents=True, exist_ok=True)
     (run / "args.json").write_text(json.dumps(vars(a), indent=1), encoding="utf-8")
-    meta = json.loads((Path(a.data) / "meta.json").read_text(encoding="utf-8"))
+    dirs = [Path(x) for x in a.data]
+    metas = [json.loads((d / "meta.json").read_text(encoding="utf-8")) for d in dirs]
+    meta = metas[0]
     size, prompts, nfr = meta["size"], meta["prompts"], meta["nfr"]
-    data = [dict(np.load(f)) for f in sorted(Path(a.data).glob("w*.npz"))]
+    for d, mt in zip(dirs[1:], metas[1:]):
+        if (mt["size"], mt["nfr"], mt["prompts"]) != (size, nfr, prompts):
+            raise SystemExit(f"{d} has other prompts, size or window length than {dirs[0]}")
+    files = [f for d in dirs for f in sorted(d.glob("w*.npz"))]
+    lazy = sum(f.stat().st_size for f in files) > 8 * 2 ** 30
+    data = [LazyWindow(f) if lazy else dict(np.load(f)) for f in files]
+    if lazy:
+        print("[train] teacher images are read from disk at each use (more than 8 GB of windows)", flush=True)
     keys = list(prompts)
     print(f"[train] {len(data)} windows x {len(keys)} prompts at {size}, {a.student_steps}-step student, lam {a.lam}", flush=True)
     combos = None
