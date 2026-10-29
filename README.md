@@ -750,6 +750,48 @@ a mismatch is refused.
   the carry-over path that ships, where consecutive frames are already tied together: there the runs of 4 lower
   flicker, texture and a little edit strength together, with or without the state, as a stronger filter does. Not adopted; in an engine the
   state would also have to be an input and an output of every call.
+- **A student in the Wan2.2 video latent space** (probe scripts not in this repository). A video VAE ties four frames
+  into one latent: the Wan2.2 VAE (16 x 16 x 4, 48 channels, Apache-2.0), with madebyollin's taew2_2_super (MIT) as
+  the real-time codec of the same latent space (1.1 + 3.5 ms per frame at 768). So consistency could come from the
+  latent space, and the transformer would run once per four frames. The 768 teacher data (92 windows of 9 frames,
+  14 instructions) were re-encoded into normalised Wan latents, and two students were trained from
+  `multi_carry_s05_lut_2step_768` (Huber on the latents, LPIPS on taew2_2_super-decoded crops, the temporal term):
+  - *key frame + renderer* (3000 steps): VIBE, unchanged, on one key frame per latent (its DC-AE latent, which a live
+    stream has), and a small convolutional net that renders the latent's Wan tokens from the edited key frame, the
+    source key frame and the source's Wan tokens.
+  - *Wan tokens* (2000 steps): VIBE editing Wan tokens directly (2 x 2 latent pixels per token), with the patch
+    embedding and output projection replaced and initialised from ridge fits between the two latent spaces.
+
+  Two training-free references bound what the latent space gives: the starting student's 2-step frames through
+  taew2_2_super, and the same student run on key frames only, each edit held for its latent with the source's motion
+  added in latent space. Streaming evaluation as in the previous entry, filter 0.85 / 0.5:
+
+  | Output | CLIP dir | Worst batch | Valid | Sobel |
+  |---|---:|---:|---:|---:|
+  | `multi_carry_s05_lut_2step_768`, 2 steps | 0.170 | 0.142 | 13.20 | 7.01 |
+  | the same, carry-over + filter (shipped) | 0.167 | 0.135 | 5.66 | 5.65 |
+  | its 2-step frames through taew2_2_super | 0.162 | 0.130 | 10.55 | 4.11 |
+  | the same + filter | 0.148 | 0.115 | 6.21 | 3.81 |
+  | key frames only, held, + source motion | 0.141 | 0.103 | 14.84 | 3.86 |
+  | Student, key frame + renderer | 0.120 | 0.091 | 12.03 | 6.37 |
+  | the same + filter | 0.115 | 0.085 | 7.20 | 5.30 |
+  | Student, Wan tokens | 0.132 | 0.098 | 10.38 | 6.21 |
+  | the same + filter | 0.124 | 0.088 | 6.36 | 5.21 |
+
+  Neither the students nor the references reach the shipped carry-over + filter path.
+  - The students keep the photo's structure and lose 22-29 % of the edit strength: the sketch and cel-shading
+    restyles mostly do not happen.
+  - The latent space smooths by itself: the 2-step frames come back with 20 % less flicker, but they lose 41 % of
+    their Sobel and 5 % of edit strength. Even with the filter they stay behind carry-over + filter on all three
+    measures.
+  - Part of the softness is the tiny codec. Source clips through taew2_2_super keep 61-67 % of their Sobel
+    (27-30 dB); the full Wan2.2 VAE reaches 32 dB but decodes at 180 ms per frame.
+  - Part is the latent itself. The teacher's frames come back from the Wan2.2 VAE at 23-25 dB: their texture
+    changes from frame to frame cannot be held in a 4-frame latent and are averaged, so a student trained on those
+    latents learns averaged targets.
+
+  A temporally compressed latent needs a generator whose textures already agree from frame to frame, and an image
+  teacher does not provide one. taew2_2's encoder also looks three frames ahead, which adds 100 ms in a live stream.
 
 ## Reference: SANA-Streaming
 
