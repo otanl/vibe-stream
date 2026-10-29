@@ -658,6 +658,7 @@ a mismatch is refused.
   - `live.py`: the same for frames arriving one at a time, host flows computed as they arrive
   - `temporal_filter.py`: display-side two-band temporal filter
   - `carry.py`: carry-over of the previous output into the next batch's start
+  - `state_attn.py`: self-attention state carried from frame to frame (experimental, Negative results)
   - `metrics.py`: video I/O, warping error, flicker split, Sobel, edge agreement, LPIPS, CLIP scores
 - `scripts/`: one entry point per step above.
 
@@ -726,6 +727,29 @@ a mismatch is refused.
   The two-band display filter ("Flicker" above: 14.0 / 8.1, Sobel 11.2, CLIP 0.208 / 0.165) keeps more texture than
   the full-band blend for slightly more flicker. The third row, with a student trained for it, became the carry-over
   ("Flicker" above), which keeps the style.
+- **Self-attention state carried from frame to frame** (`train_student.py --state_carry`, `state_attn.py`). VIBE's
+  self-attention is ReLU linear attention: a frame's keys and values reduce to one (d+1) x d matrix per head,
+  S = [V; 1] K^T, so frame t can read S_t + alpha S'_t-1, S' accumulated over the earlier frames: a recurrent memory
+  at no extra tokens, with no positional embedding in the way. Without retraining (2-step path of
+  `multi_carry_s05_lut_2step_768`, two clips x two instructions, state carried across batches per denoising step),
+  alpha 0.9 cut flicker by 21 % with no lag (edge agreement with the frame two back unchanged) and slightly softer
+  backgrounds in pans. Trained: 800 steps from that student with the carried step on runs of 4 consecutive frames and
+  a temporal term between them (`--carry_seq 4`, which the state needs to learn from), per-block alpha learned from
+  0.5 (it ended at 0.34-0.68), and a control without the state. Scored in PyTorch on the streaming path (the four
+  evaluation clips played forward then backward, 96 frames; oil, anime, ukiyo-e and night trained, gouache and autumn
+  held out; taesana engines):
+
+  | Student | 2 steps: valid | Sobel | Carry-over + filter 0.85 / 0.5: CLIP dir | Worst batch | Valid | Sobel |
+  |---|---:|---:|---:|---:|---:|---:|
+  | `multi_carry_s05_lut_2step_768` | 13.20 | 7.01 | 0.167 | 0.135 | 5.66 | 5.65 |
+  | + runs of 4, no state (control) | 13.25 | 6.97 | 0.161 | 0.131 | 4.89 | 4.91 |
+  | + runs of 4, state carry | **11.43** | 6.96 | 0.162 | 0.131 | 4.85 | 4.94 |
+  | the same, state carry off | 13.47 | 6.99 | 0.162 | 0.131 | 4.94 | 4.96 |
+
+  The state helps the 2-step path (14 % less flicker than the control at the same texture and edit strength) but not
+  the carry-over path that ships, where consecutive frames are already tied together: there the runs of 4 lower
+  flicker, texture and a little edit strength together, with or without the state, as a stronger filter does. Not adopted; in an engine the
+  state would also have to be an input and an output of every call.
 
 ## Reference: SANA-Streaming
 
