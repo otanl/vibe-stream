@@ -16,7 +16,11 @@ and about the same edit strength; with the display filter on top, the flicker is
 at 640 and 31.1 fps at 768 ("Flicker"). One trained with a colour-mapped fill also keeps the 2-step path's colours,
 at the same speed at 768 and a few percent slower at 640. With taesana as TensorRT engines, the transformer as an INT8
 engine and its cross-attention K / V computed once per batch, that path (carry-over + filter) runs at 49.7 fps at 768
-and 67.4 fps at 640 ("Faster"). The numbers below say what has been measured and how.
+and 67.4 fps at 640 ("Faster"). A student trained further on 14 instructions and on windows with twice the motion
+(`multi_carry_s05_lut_2step_768`, the default at 768 since) follows the 8-step teacher more closely, also on
+instructions it never saw, no longer loses edit strength on the carry-over path, and with a stronger filter
+(0.85 / 0.5) flickers less than the previous setting at the same speed ("Many instructions"). The numbers below say
+what has been measured and how.
 
 ## Demo
 
@@ -26,7 +30,9 @@ Input | oil painting | anime on five DAVIS-2017 clips through the real-time path
 student trained for the carry-over with the colour-mapped fill (`lam4_carry_s05_lut_2step_768`) with the transformer
 as an INT8 TensorRT engine, taesana as TensorRT engines, the carry-over and the temporal filter 0.7 / 0.3
 (`scripts/make_demo.py --tae_engine ... --carry --temporal_filter 0.7 0.3`; see "Flicker" and Speed, "Faster"). Each
-output panel shows the loop fps of its run: 48-50 fps on these short clips, 49.7 fps on the 480-frame loop.
+output panel shows the loop fps of its run: 48-50 fps on these short clips, 49.7 fps on the 480-frame loop. The
+default at 768 is now `multi_carry_s05_lut_2step_768` with the filter at 0.85 / 0.5 ("Many instructions"); the videos
+show the previous one.
 
 The same student and engine on the plain 2-step path (no carry-over, no filter: about twice the flicker; 30-32 fps):
 
@@ -201,8 +207,9 @@ of 8 at 768, more than the 267 ms a 30 fps camera leaves, so the delay grew with
 `vibe_stream.live.LiveEditor` computes each frame's flows on a thread as the frame arrives (`TemporalFilter.host_flow`,
 `Carry.host_flow`) and hands the batch to the GPU as soon as it is complete; with the batch-8 engines its output is
 identical to `StreamEditor.run`'s bit for bit. Delay from a frame's hand-over to its edited copy back on the host,
-`blackswan` handed over at 30 fps in wall-clock time (`scripts/measure_latency.py`), INT8 engines with carry-over +
-filter, mean / 95th percentile, two rounds:
+`blackswan` handed over at 30 fps in wall-clock time (`scripts/measure_latency.py`), INT8 engines of
+`lam4_carry_s05_lut_2step_768` / `_640` with carry-over + filter 0.7 / 0.3 (the default student's engines are the same
+network at the same speed, "Many instructions"), mean / 95th percentile, two rounds:
 
 | Batch | 768: delay | 768: offline loop fps | 640: delay | 640: offline loop fps |
 |---|---:|---:|---:|---:|
@@ -445,8 +452,9 @@ styles (Hokusai's blue, Mucha's sepia, Beardsley's black and white) strengthen. 
 was trained on, do not fade. A keyframe every 4 batches brings the later batches most of the way back (Van Gogh
 0.061 to 0.096; 2-step path 0.115) at 27.8 fps for 16-22 % more flicker, but the style visibly pulses with the
 keyframes; every 2 batches adds little more. Starting the carried step from sigma 0.6 instead of the trained 0.5
-holds a little more (0.076) for 6-10 % more flicker, without pulsing. Training the carried step on more styles is the
-open fix.
+holds a little more (0.076) for 6-10 % more flicker, without pulsing. Training the carried step on more instructions
+removes the fading for written instructions ("Many instructions" below); the reference styles have not been measured
+with that student.
 
 **Fine-tuning the base model for the reference image.** To keep the image way's style without its content, VIBE
 itself was fine-tuned on its own selected outputs. Data (`make_style_data.py`): 2000 Open Images photos x 3 of 484
@@ -470,6 +478,56 @@ five of six, and both together (`--style_way both`: the written instruction with
 frame) gain most, 0.075 against 0.071 (image) and 0.065 (instruction), and look the most balanced: Kandinsky as
 vivid as with the instruction, Hokusai's subject kept. The embedding has a fixed length, so the way costs nothing per
 frame. A second round of the same loop on the fine-tuned model's outputs did not help (Negative results).
+
+### Many instructions
+
+`multi_carry_s05_lut_2step_768`, the default at 768: `lam4_carry_s05_lut_2step_768` trained further on 14
+instructions instead of two (`oil`, `anime` and the first twelve of `presets.MORE_PROMPTS`: nine styles and three
+global edits) and on windows of every second frame besides the consecutive ones (`make_teacher_data.py --stride 2`:
+twice the motion between frames, where the carry-over lost edit strength). Teacher data: 47 + 45 windows of 10 frames
+(44 + 51 min, 29 GB; above 8 GB of windows `train_student.py` reads the teacher images from disk at each use), then
+2500 steps from the LUT student (2.8 h at 4.0 s/step). Four instructions are kept out of training
+(`presets.HELD_OUT`: gouache, crayon, autumn, fog).
+
+`scripts/eval_stream.py`: the four evaluation clips played forward then backward (96 frames, no cut), seven of the
+trained instructions (oil, anime, watercolour, pencil sketch, ukiyo-e, winter, night) and the four held out, INT8
+engines and taesana engines at 768. *Worst batch*: the CLIP direction of the batch of 8 frames that scored lowest in
+a clip, averaged over clips and instructions; it shows where the carry-over fades in fast motion. *LPIPS to teacher*:
+the 2-step path against the 8-step teacher on frames 0-28, where the teacher's CLIP direction is 0.199 / 0.167.
+Values for trained / held-out instructions:
+
+| Student | Path / display | CLIP dir | Worst batch | Valid | Warp | Sobel | LPIPS to teacher |
+|---|---|---:|---:|---:|---:|---:|---:|
+| `lam4_carry_s05_lut_2step_768` | 2 steps | 0.189 / 0.174 | 0.159 / 0.146 | 12.82 / 10.87 | 15.25 / 13.73 | 7.52 / 5.75 | 0.266 / 0.231 |
+| | carry-over + filter 0.7 / 0.3 | 0.180 / 0.162 | 0.146 / 0.130 | 5.76 / 5.10 | 8.75 / 8.21 | 5.70 / 4.74 | |
+| | carry-over + filter 0.85 / 0.5 | 0.177 / 0.161 | 0.144 / 0.130 | **4.91 / 4.35** | 7.96 / 7.52 | 5.21 / 4.34 | |
+| `multi_carry_s05_lut_2step_768` | 2 steps | 0.187 / 0.169 | 0.158 / 0.142 | 11.94 / 10.37 | 14.04 / 12.94 | 6.46 / 4.98 | **0.229 / 0.196** |
+| | carry-over + filter 0.7 / 0.3 | **0.190 / 0.168** | **0.159 / 0.134** | 6.43 / 5.26 | 9.38 / 8.30 | 6.19 / 4.49 | |
+| | carry-over + filter 0.85 / 0.5 (default) | 0.188 / 0.167 | 0.158 / 0.134 | 5.49 / 4.51 | 8.50 / 7.60 | 5.66 / 4.13 | |
+
+- The 2-step path comes closer to the teacher, on held-out instructions as much as on trained ones (LPIPS 0.266 to
+  0.229 and 0.231 to 0.196), most for pencil sketch (0.279 to 0.203), night (0.265 to 0.187) and crayon (0.294 to
+  0.234). Its CLIP direction does not move on average; where it drops, the old student had gone past the teacher
+  (pencil sketch 0.217 and crayon 0.187 against the teacher's 0.178 and 0.151: it keeps the background the teacher
+  drops, see "Prompts the student never saw").
+- The carry-over no longer fades. With the filter at 0.7 / 0.3 the carry-over path scores as high as the 2-step path
+  (0.190 against 0.187; before 0.180 against 0.189), and the worst batch rises from 0.146 to 0.159. In `parkour`, the
+  fastest clip, it rises for 9 of 11 instructions (mean 0.109 to 0.126; pencil sketch 0.11 to 0.18). Ukiyo-e and
+  night, which faded most, gain most (0.130 to 0.148 and 0.120 to 0.152).
+- More of the style is kept, and more of it moves: at the same filter the new student flickers 12 % more on trained
+  instructions (6.43 against 5.76; held out 3 %), in both bands, with 9 % more Sobel. The filter costs little edit
+  strength (0.190 to 0.188 from 0.7 / 0.3 to 0.85 / 0.5), so at 0.85 / 0.5 the new student flickers less than the old
+  one at 0.7 / 0.3 (5.49 against 5.76, held out 4.51 against 5.10) with more edit strength (0.188 against 0.180,
+  worst batch 0.158 against 0.146) and the same texture (Sobel 5.66 against 5.70). That is the default. The old
+  student at 0.85 / 0.5 flickers least (4.91) with the least edit strength and texture. Strengthening the low band
+  alone (`--filters 0.85 0.3`) barely helps (6.33): the extra flicker is in the strokes. On the frames of largest
+  motion in `parkour` and `dance-twirl`, 0.85 / 0.5 shows no double edges, and the old student is visibly paler there
+  than the new one.
+- Same network, same speed: both INT8 engines run at 14.9 ms per frame per step at batch 8 (build-time bench), and
+  the engines for batch 4 and 2 (live input, "Delay with a live source") quantize at least as well as the one for batch 8
+  (velocity error 3.1 / 5.2-5.3 % against 3.1 / 6.2 %). INT8 against fp16 on 18 clip x instruction pairs of `parkour`
+  and `libby`, carry-over + filter 0.7 / 0.3 (LPIPS on the 2-step path): CLIP direction
+  0.177 / 0.178, flicker 6.59 / 6.61, LPIPS to teacher 0.219 / 0.217.
 
 ## Setup
 
@@ -502,12 +560,17 @@ python scripts/build_trt.py --student runs/lam4_2step/lora.safetensors \
     --engine out/trt/vibe_lam4_2step_768_b8_int8.engine --int8
 python scripts/stream_video.py --input ... --engine out/trt/vibe_lam4_2step_768_b8_int8.engine \
     --tae_engine out/trt/taesana_768_b8
+# ... the default at 768: the multi-instruction student (trained below), carry-over and the filter at 0.85 / 0.5
+python scripts/build_trt.py --student runs/multi_carry_s05_lut_2step_768/lora.safetensors \
+    --engine out/trt/vibe_multi_carry_s05_lut_2step_768_b8_int8.engine --int8
+python scripts/stream_video.py --input ... --engine out/trt/vibe_multi_carry_s05_lut_2step_768_b8_int8.engine \
+    --tae_engine out/trt/taesana_768_b8 --carry --temporal_filter 0.85 0.5
 # ... delay with a live source (frames handed over at 30 fps), here with engines for batch 2
 python scripts/build_trt_tae.py --size 768 --batch 2 --prefix out/trt/taesana_768_b2
-python scripts/build_trt.py --student runs/lam4_carry_s05_lut_2step_768/lora.safetensors \
-    --engine out/trt/vibe_lam4_carry_s05_lut_2step_768_b2_int8.engine --int8 --batch 2
-python scripts/measure_latency.py --engine out/trt/vibe_lam4_carry_s05_lut_2step_768_b2_int8.engine \
-    --tae_engine out/trt/taesana_768_b2 --carry --temporal_filter 0.7 0.3
+python scripts/build_trt.py --student runs/multi_carry_s05_lut_2step_768/lora.safetensors \
+    --engine out/trt/vibe_multi_carry_s05_lut_2step_768_b2_int8.engine --int8 --batch 2 --calib_clips 25
+python scripts/measure_latency.py --engine out/trt/vibe_multi_carry_s05_lut_2step_768_b2_int8.engine \
+    --tae_engine out/trt/taesana_768_b2 --carry --temporal_filter 0.85 0.5
 # ... or with PyTorch only
 python scripts/stream_video.py --input ... --student runs/lam4_2step/lora.safetensors
 # ... with the display-side temporal filter and / or the carry-over (any of these scripts, including make_demo.py);
@@ -538,6 +601,17 @@ python scripts/train_student.py --data data/teacher_640 --run runs/lam4_carry_s0
     --lam 4 --w_carry 1 --carry_sigma 0.5 --carry_fill lut --grad_ckpt
 python scripts/eval_flicker.py --student runs/lam4_carry_s05_lut_2step_640/lora.safetensors --carry \
     --out out/flicker/lam4_carry_s05_lut_2step_640_carry.json
+# ... the default at 768: 14 instructions on the usual windows (oil / anime copied from data/teacher_768) and on
+# windows of every second frame, then 2500 steps from the 768 LUT carry student (~2.8 h at 4.0 s/step)
+P="oil anime watercolor pencil ukiyoe impressionist comic charcoal pastel stainedglass popart winter night sunset"
+python scripts/make_teacher_data.py --out data/teacher_768_multi --reuse data/teacher_768 --prompts $P    # 44 min
+python scripts/make_teacher_data.py --out data/teacher_768_multi_s2 --stride 2 --prompts $P             # 51 min
+python scripts/train_student.py --data data/teacher_768_multi data/teacher_768_multi_s2 \
+    --run runs/multi_carry_s05_lut_2step_768 --student_steps 2 --lam 4 --w_carry 1 --carry_sigma 0.5 \
+    --carry_fill lut --grad_ckpt --steps 2500 --init runs/lam4_carry_s05_lut_2step_768/lora.safetensors
+# Streaming-path quality over trained and held-out instructions, worst batch included; --table compares result files
+python scripts/eval_stream.py --engine out/trt/vibe_multi_carry_s05_lut_2step_768_b8_int8.engine \
+    --filters 0.7 0.3 0.85 0.5 --teacher --out out/eval_stream/multi_carry_s05_lut_768_int8.json
 
 # Fine-tuning data for style from a reference image: public-domain artworks from the Art Institute
 # of Chicago API (CC0 images), Open Images validation photos listed as CC BY 2.0 (attribution kept in images.jsonl),
@@ -563,8 +637,10 @@ python scripts/build_trt.py --student runs/refs_carry_s05_lut_2step_768/lora.saf
 ```
 
 A student is tied to its resolution and its init noise (stored in the file). Other instructions than the ones it was
-trained on work for styles and global edits, less for edits that rebuild the scene, and the carried step holds
-texture styles less well than its own (Results, "Other instructions and style from a reference image"). A TensorRT
+trained on work for styles and global edits, less for edits that rebuild the scene; the two-instruction students'
+carried step holds texture styles less well than their own, the multi-instruction student's holds written
+instructions as well as its 2-step path (Results, "Other instructions and style from a reference image" and "Many
+instructions"). A TensorRT
 engine is tied to one resolution, one batch size, one TensorRT version and platform; `<engine>.json` records them and
 a mismatch is refused.
 

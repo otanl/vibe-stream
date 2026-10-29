@@ -78,28 +78,34 @@ def _warp(img: np.ndarray, flow: np.ndarray) -> np.ndarray:
                      cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
 
 
-def warping_error(inputs: Sequence[np.ndarray], outputs: Sequence[np.ndarray]) -> float:
+def input_flows(inputs: Sequence[np.ndarray]) -> List[np.ndarray]:
+    """Farneback flows t -> t+1 of a clip, for `warping_error` / `flicker` on several outputs of the same input."""
+    return [farneback(inputs[t], inputs[t + 1]) for t in range(len(inputs) - 1)]
+
+
+def warping_error(inputs: Sequence[np.ndarray], outputs: Sequence[np.ndarray],
+                  flows: Optional[Sequence[np.ndarray]] = None) -> float:
     if len(inputs) != len(outputs):
         raise ValueError(f"frame count mismatch: in={len(inputs)} out={len(outputs)}")
     errs = []
     for t in range(len(inputs) - 1):
-        flow = farneback(inputs[t], inputs[t + 1])
+        flow = flows[t] if flows is not None else farneback(inputs[t], inputs[t + 1])
         errs.append(float(np.mean(np.abs(outputs[t].astype(np.float32) - _warp(outputs[t + 1].astype(np.float32), flow)))))
     return float(np.mean(errs)) if errs else 0.0
 
 
 def flicker(inputs: Sequence[np.ndarray], outputs: Sequence[np.ndarray], sigma: float = 4.0,
-            valid_below: float = 6.0) -> dict:
+            valid_below: float = 6.0, flows: Optional[Sequence[np.ndarray]] = None) -> dict:
     """Output change where the input's motion is explained, split into bands.
 
     Like the warping error (Farneback flow on the input, output t+1 warped back to t), but averaged only over pixels
     where the same warp reproduces the input to within `valid_below` (mean over RGB, 0-255): occlusions, motion blur
     and flow failures are left out, so what remains is change the edit added. `low` / `high` split that change into
     a Gaussian low band (sigma px: colour blotches, the scale of the 32-pixel latent tokens) and the rest (strokes,
-    grain). Returns dict(valid, low, high), each a clip mean on the 0-255 scale."""
+    grain). Returns dict(valid, low, high), each a clip mean on the 0-255 scale. `flows`: precomputed `input_flows`."""
     v, lo, hi = [], [], []
     for t in range(len(inputs) - 1):
-        flow = farneback(inputs[t], inputs[t + 1])
+        flow = flows[t] if flows is not None else farneback(inputs[t], inputs[t + 1])
         ok = np.abs(inputs[t].astype(np.float32) - _warp(inputs[t + 1].astype(np.float32), flow)).mean(2) < valid_below
         a, b = outputs[t].astype(np.float32), _warp(outputs[t + 1].astype(np.float32), flow)
         la, lb = cv2.GaussianBlur(a, (0, 0), sigma), cv2.GaussianBlur(b, (0, 0), sigma)
