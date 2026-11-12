@@ -29,6 +29,47 @@ MORE_PROMPTS = {
 HELD_OUT = ("gouache", "crayon", "autumn", "fog")
 ALL_PROMPTS = {**PROMPTS, **MORE_PROMPTS}
 
+# What FLUX.2-klein-4B is given instead, where it reads the instruction above differently from VIBE (scripts/
+# klein_teacher.py): a garish oil painting, a pastel without chalk, ukiyo-e with a border and a seal. The student is
+# still trained on ALL_PROMPTS[key].
+KLEIN_PROMPTS = {
+    "oil": "transfer this to oil painting style with visible brushstrokes, keep the original colors",
+    "pastel": "redraw this as a pastel chalk drawing with rich colors and visible chalky strokes",
+    "ukiyoe": "transfer this to ukiyo-e woodblock print style, flat colors and bold outlines, the picture fills the "
+              "whole image, no border, no text, no seal",
+}
+
+# Broad instructions a student resized to another size with transformer blocks removed is self-distilled on, from the
+# full student at that size (scripts/resize_pack.py --mode self), so that it keeps what the full student does beyond
+# the instructions it was trained on. None of HELD_OUT.
+BROAD_PROMPTS = {
+    "cartoon3d": "transfer this to 3D cartoon render style, soft studio lighting",
+    "pixelart": "transfer this to pixel art style, limited color palette",
+    "mosaic": "transfer this to mosaic style, small colored tiles",
+    "inkwash": "transfer this to Chinese ink wash painting style, black ink on rice paper",
+    "cyberpunk": "make it cyberpunk, neon pink and blue lights",
+    "sepia": "transfer this to an old sepia photograph with film grain",
+    "bw": "make it a black and white photo, high contrast",
+    "pointillism": "transfer this to pointillism style, tiny dots of pure color",
+    "cubism": "transfer this to cubist painting style, fragmented geometric shapes",
+    "artnouveau": "transfer this to art nouveau style, flowing ornamental lines",
+    "lowpoly": "transfer this to low poly 3D style, flat shaded facets",
+    "clay": "transfer this to claymation style, plasticine textures",
+    "embroidery": "transfer this to embroidery, colored threads stitched on fabric",
+    "graffiti": "transfer this to graffiti street art style, spray paint",
+    "colorpencil": "transfer this to a colored pencil drawing on paper",
+    "swirl": "transfer this to post-impressionist style, swirling thick brushstrokes",
+    "lineart": "transfer this to clean line art, black outlines on white",
+    "woodcut": "transfer this to a black and white woodcut print, carved lines",
+    "rain": "make it rainy, wet reflective surfaces",
+    "spring": "make it spring, fresh green leaves and blossoms",
+    "overcast": "make it overcast, soft grey daylight",
+    "underwater": "make it look underwater, blue-green tint",
+    "moonlight": "make it a moonlit night, cold blue light",
+    "cinematic": "give it a cinematic teal and orange color grade",
+    "vhs": "make it look like an old VHS recording, washed-out colors and scan lines",
+}
+
 # (source, target) captions for the CLIP scores of scripts/eval_student.py, per prompt key
 CLIP_CAPTIONS = {
     "oil": ("a photo", "an oil painting with vibrant colors"),

@@ -44,6 +44,9 @@ SOFTWARE.
 | Qwen3-VL-2B (VIBE's text encoder) | [Qwen](https://huggingface.co/Qwen) | Apache-2.0 |
 | taesana weights | [madebyollin/taesd](https://github.com/madebyollin/taesd) | MIT |
 | CLIP ViT-L/14 (evaluation only, `metrics.CLIPScore`) | [openai/clip-vit-large-patch14](https://huggingface.co/openai/clip-vit-large-patch14) | MIT |
+| SA-V clips (training windows of the SA-V students, `sav_windows.py`) | [Meta SA-V](https://ai.meta.com/datasets/segment-anything-video/) | CC BY 4.0; downloading needs Meta's terms accepted. The clips are not redistributed here |
+| FLUX.2-klein-4B (teacher of the SA-V students, `klein_teacher.py`) | [black-forest-labs/FLUX.2-klein-4B](https://huggingface.co/black-forest-labs/FLUX.2-klein-4B) | Apache-2.0 |
+| YuNet face detector (face pass, `vibe_stream.face`) | [opencv/opencv_zoo](https://github.com/opencv/opencv_zoo/tree/main/models/face_detection_yunet) | MIT |
 | DAVIS-2017 clips used for training and evaluation; five appear in the README demo video | [davischallenge.org](https://davischallenge.org/davis2017/code.html) | the organizers license their annotations under CC BY 4.0 (challenge rules page) and the site's dataset metadata says CC BY-NC 4.0; no separate licence is stated for the video frames. The clips are not redistributed here |
 
 Check the publishers' current terms before redistributing weights or derived checkpoints (such as a trained student

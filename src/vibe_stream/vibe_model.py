@@ -13,6 +13,7 @@ a deterministic function of the frame, which is what lets a 1- or 2-step student
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import os
 import sys
@@ -22,6 +23,7 @@ from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
 import torch
+import torch.nn as nn
 from PIL import Image
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -88,17 +90,113 @@ def student_schedule(scheduler, k: int, device) -> Tuple[List[torch.Tensor], Lis
     return list(s.timesteps), [float(v) for v in s.sigmas]
 
 
+class _NoAttention(nn.Module):
+    def set_processor(self, processor) -> None:
+        pass
+
+
+class SkipBlock(nn.Module):
+    """A removed transformer block: returns its input. Its `attn2.set_processor` does nothing (the engine export sets
+    the cross-attention processor of every block)."""
+
+    def __init__(self):
+        super().__init__()
+        self.attn2 = _NoAttention()
+
+    def forward(self, hidden_states, *args, **kwargs):
+        return hidden_states
+
+
+class CPUEmbedding(nn.Module):
+    """A token embedding table kept on the CPU (Qwen3-VL's, tied with its lm_head: 0.6 GB): the ids are looked up
+    there and the rows handed to `device`. Exact."""
+
+    def __init__(self, emb: nn.Embedding, device):
+        super().__init__()
+        w = emb.weight
+        # the parameter is shared with the tied lm_head, so moving its data takes both off the GPU (a module .cpu() did
+        # not move it in a model loaded with an HQQ quantization config)
+        w.data = w.data.to("cpu")
+        self.weight = w
+        self.device = device
+
+    def forward(self, ids):
+        return nn.functional.embedding(ids.cpu(), self.weight).to(self.device)
+
+
+def load_text_encoder_hqq(weights, bits: int, device, vision: bool = False):
+    """Qwen3-VL with HQQ weight-only `bits`-bit (group 64) language-model linear layers, and the vision tower's with
+    `vision`, resident on `device`; its lm_head dropped (the embedding reads hidden states only) and its token table on
+    the CPU (`CPUEmbedding`). Needs the `hqq` package. transformers' HQQ path loads the modules it skips in fp32 and
+    makes the HQQ layers dequantize to fp32; both are put back to bf16 here. On an RTX 4060 Ti at 640 the encoder then
+    holds 2.1 GB (bf16 resident: 4.0 GB)."""
+    from hqq.core.quantize import HQQLinear
+    from transformers import HqqConfig, Qwen3VLForConditionalGeneration
+    skip = ["lm_head"] + ([] if vision else ["visual"])
+    te = Qwen3VLForConditionalGeneration.from_pretrained(
+        Path(weights) / "text_encoder", dtype=torch.bfloat16, device_map={"": device},
+        quantization_config=HqqConfig(nbits=bits, group_size=64, skip_modules=skip))
+    for p in te.parameters():
+        if p.dtype == torch.float32:
+            p.data = p.data.to(torch.bfloat16)
+    for m in te.modules():
+        if isinstance(m, HQQLinear):
+            m.compute_dtype = m.meta["compute_dtype"] = torch.bfloat16
+            for k in ("scale", "zero"):
+                if isinstance(m.meta.get(k), torch.Tensor) and m.meta[k].is_floating_point():
+                    m.meta[k] = m.meta[k].to(torch.bfloat16)
+            for k in ("meta_scale", "meta_zero"):
+                if isinstance(m.meta.get(k), dict) and "compute_dtype" in m.meta[k]:
+                    m.meta[k]["compute_dtype"] = torch.bfloat16
+            if m.bias is not None:
+                m.bias.data = m.bias.data.to(torch.bfloat16)
+    te.lm_head = nn.Identity()
+    te.set_input_embeddings(CPUEmbedding(te.get_input_embeddings(), device))
+    torch.cuda.empty_cache()
+    return te
+
+
+def student_model_args(meta: dict) -> dict:
+    """VibeModel arguments a student's metadata fixes: its size and the transformer blocks it was trained without."""
+    return dict(size=int(meta.get("size", 768)), remove_blocks=meta.get("removed_blocks") or ())
+
+
 class VibeModel:
     """VIBE's pipeline plus the pieces this repo calls directly.
 
     `size` is the working resolution (square, a multiple of 32). VIBE's own call would snap it to an aspect-ratio bin
     (768 goes to the 512 bin unless `use_resolution_binning=False`).
+
+    With `denoiser_on_gpu=False` the transformer's blocks and DC-AE stay on the CPU, for runs where a TensorRT engine
+    and taesana stand in for them: only the part of the transformer the instruction embedding runs through (meta
+    queries, edit head, prompt projection) goes to the GPU. `velocity`, `sample`, `student`, `encode` and `decode_u8`
+    are then unavailable.
+
+    `text_encoder_bits` (8 or 4) loads Qwen3-VL with HQQ weight-only quantized language-model layers
+    (`load_text_encoder_hqq`; `quantize_vision` the vision tower's too), resident on the GPU (`keep_text_encoder` must
+    stay True). 8 bits changes the instruction embedding by about 12 % and the output by LPIPS 0.014 on average, about
+    as much as computing the embedding in fp32 instead of bf16; 4 bits by 69 % (visibly). `style_prompt` needs the
+    unquantized encoder.
+
+    `edit_head_on_gpu=False` (with `denoiser_on_gpu=False`) keeps the edit head (0.5 GB) on the CPU except while an
+    instruction is embedded, which then takes about 0.2 s longer.
+
+    `remove_blocks` replaces those transformer blocks by pass-throughs (`SkipBlock`) right after loading: a student
+    trained that way has no LoRA entries for them and records them (`removed_blocks` in its metadata), and a TensorRT
+    engine exported from such a model has no layers for them (README, "Removing transformer blocks").
     """
 
     def __init__(self, weights=DEFAULT_WEIGHTS, size: int = 768, device: str = "cuda", keep_text_encoder: bool = True,
-                 noise: torch.Tensor | None = None):
+                 noise: torch.Tensor | None = None, denoiser_on_gpu: bool = True, text_encoder_bits: int | None = None,
+                 quantize_vision: bool = False, edit_head_on_gpu: bool = True, remove_blocks: Sequence[int] = ()):
         add_vibe_to_path()
         from vibe.generative_pipeline import VIBESanaEditingPipeline
+        if text_encoder_bits not in (None, 4, 8):
+            raise ValueError(f"text_encoder_bits must be 4 or 8, not {text_encoder_bits}")
+        if text_encoder_bits and not keep_text_encoder:
+            raise ValueError("a quantized text encoder cannot be moved off the GPU; keep it")
+        if not edit_head_on_gpu and denoiser_on_gpu:
+            raise ValueError("edit_head_on_gpu=False goes with denoiser_on_gpu=False")
         # TF32 for fp32 matmuls (process-wide). Qwen3-VL's rotary angles are an fp32 matmul, so this changes the
         # embedding and, through it, VIBE's output; every reported number and the released student used it.
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -107,12 +205,36 @@ class VibeModel:
         if self.device.type == "cuda" and self.device.index is None:
             self.device = torch.device("cuda", torch.cuda.current_device())   # parameters report cuda:N
         self.size = size
-        self.pipe = VIBESanaEditingPipeline.from_pretrained(str(weights), torch_dtype=torch.bfloat16).to(self.device)
+        extra = {}
+        self.te_resident = bool(text_encoder_bits)
+        if text_encoder_bits:
+            extra["text_encoder"] = load_text_encoder_hqq(weights, text_encoder_bits, self.device, quantize_vision)
+        self.pipe = VIBESanaEditingPipeline.from_pretrained(str(weights), torch_dtype=torch.bfloat16, **extra)
+        if denoiser_on_gpu and not text_encoder_bits:
+            self.pipe.to(self.device)
+        elif denoiser_on_gpu:
+            self.pipe.transformer.to(self.device)
+            self.pipe.vae.to(self.device)
+        else:
+            tr = self.pipe.transformer
+            # the denoiser's own modules (blocks, the timestep embedding) stay on the CPU; the edit head too if asked
+            stay = {"transformer_blocks", "time_embed"} | (set() if edit_head_on_gpu else {"edit_head"})
+            for name, child in tr.named_children():
+                if name not in stay:
+                    child.to(self.device)
+            for p in tr.parameters(recurse=False):
+                p.data = p.data.to(self.device)
+            if keep_text_encoder and not text_encoder_bits:
+                self.pipe.text_encoder.to(self.device)
+        self.edit_head_on_gpu = edit_head_on_gpu
         # __call__ hands precomputed embeddings to Sana's input check without the attention mask that check insists
         # on; the mask plays no part in VIBE's denoiser, so the check is skipped in that case.
         check = self.pipe.check_inputs
         self.pipe.check_inputs = lambda *a, **kw: None if kw.get("prompt_embeds") is not None else check(*a, **kw)
         self.tr = self.pipe.transformer
+        self.removed_blocks = sorted(set(int(i) for i in remove_blocks))
+        for i in self.removed_blocks:
+            self.tr.transformer_blocks[i] = SkipBlock()
         self.vae = self.pipe.vae
         self.sf = self.vae.config.scaling_factor
         self.tscale = getattr(self.tr.config, "timestep_scale", 1.0)
@@ -125,29 +247,43 @@ class VibeModel:
 
     # ---------------------------------------------------------------- conditioning
     def offload_text_encoder(self) -> None:
+        if self.te_resident:            # a quantized encoder stays where it was loaded
+            return
         self.pipe.text_encoder.to("cpu")
         torch.cuda.empty_cache()
 
-    @torch.inference_mode()
-    def embed(self, prompt: str, frame: np.ndarray) -> torch.Tensor:
-        """The instruction embedding (1, L, D), bf16, for one RGB uint8 frame. Brings the text encoder back to the
-        GPU for the call if it was offloaded."""
+    @contextlib.contextmanager
+    def _embedding_modules(self):
+        """The text encoder, and the edit head if it waits on the CPU, on the GPU for an embedding."""
         te = self.pipe.text_encoder
-        offloaded = next(te.parameters()).device != self.device
+        offloaded = not self.te_resident and next(te.parameters()).device != self.device
         if offloaded:
             te.to(self.device)
+        if not self.edit_head_on_gpu:
+            self.tr.edit_head.to(self.device)
         try:
-            emb, _ = self.pipe._get_editing_embeddings(edit_prompt=prompt, conditioning_image=Image.fromarray(frame))
+            yield
         finally:
+            if not self.edit_head_on_gpu:
+                self.tr.edit_head.to("cpu")
             if offloaded:
                 self.offload_text_encoder()
+            elif not self.edit_head_on_gpu:
+                torch.cuda.empty_cache()
+
+    @torch.inference_mode()
+    def embed(self, prompt: str, frame: np.ndarray) -> torch.Tensor:
+        """The instruction embedding (1, L, D), bf16, for one RGB uint8 frame. Brings the text encoder (and the edit
+        head) to the GPU for the call if they wait on the CPU."""
+        with self._embedding_modules():
+            emb, _ = self.pipe._get_editing_embeddings(edit_prompt=prompt, conditioning_image=Image.fromarray(frame))
         return emb.contiguous()
 
     @torch.inference_mode()
     def embed_with_reference(self, prompt: str, frame: np.ndarray, reference: np.ndarray | Image.Image) -> torch.Tensor:
         """Like `embed`, with a second image after the frame in the same user turn, e.g. "transfer this to the artistic
         style of the second image". VIBE was trained with one image; the second one brings its content along as well
-        as its style. Does not bring an offloaded text encoder back."""
+        as its style. Brings the text encoder (and the edit head) to the GPU for the call, as `embed`."""
         pipe = self.pipe
         f = Image.fromarray(frame)
         ref = reference if isinstance(reference, Image.Image) else Image.fromarray(reference)
@@ -157,10 +293,11 @@ class VibeModel:
                                                   add_generation_prompt=False)
         x = pipe.tokenizer(text=[text], images=[f, ref], padding=True, return_tensors="pt",
                            min_pixels=pipe.min_pixels, max_pixels=pipe.max_pixels).data
-        mi = pipe.prepare_initial_input_embeddings(**{k: v.to(self.device) for k, v in x.items()})
-        hidden = pipe.text_encoder.language_model(input_ids=None, **mi).last_hidden_state
-        meta = pipe.transformer.get_hidden_states_for_meta_tokens(hidden, mi["attention_mask"])
-        return pipe.transformer.forward_edit_heads(meta.shape[0], meta)[0].contiguous()
+        with self._embedding_modules():
+            mi = pipe.prepare_initial_input_embeddings(**{k: v.to(self.device) for k, v in x.items()})
+            hidden = pipe.text_encoder.language_model(input_ids=None, **mi).last_hidden_state
+            meta = pipe.transformer.get_hidden_states_for_meta_tokens(hidden, mi["attention_mask"])
+            return pipe.transformer.forward_edit_heads(meta.shape[0], meta)[0].contiguous()
 
     @torch.inference_mode()
     def style_prompt(self, image: np.ndarray | Image.Image, max_new_tokens: int = 80) -> str:
@@ -170,6 +307,8 @@ class VibeModel:
         and cutting it into shuffled tiles first removes the content but most of the style too. Like `embed`, brings
         the text encoder back to the GPU for the call if it was offloaded.
         """
+        if self.te_resident:
+            raise RuntimeError("style_prompt needs the unquantized text encoder (its lm_head is dropped when quantized)")
         ref = image if isinstance(image, Image.Image) else Image.fromarray(image)
         proc, te = self.pipe.tokenizer, self.pipe.text_encoder
         msg = [{"role": "user", "content": [{"type": "image", "image": ref}, {"type": "text", "text": STYLE_QUESTION}]}]

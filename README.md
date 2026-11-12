@@ -19,8 +19,12 @@ engine and its cross-attention K / V computed once per batch, that path (carry-o
 and 67.4 fps at 640 ("Faster"). A student trained further on 14 instructions and on windows with twice the motion
 (`multi_carry_s05_lut_2step_768`, the default at 768 since) follows the 8-step teacher more closely, also on
 instructions it never saw, no longer loses edit strength on the carry-over path, and with a stronger filter
-(0.85 / 0.5) flickers less than the previous setting at the same speed ("Many instructions"). The numbers below say
-what has been measured and how.
+(0.85 / 0.5) flickers less than the previous setting at the same speed ("Many instructions"). These students learn
+from DAVIS-2017 clips; one trained on SA-V clips (CC BY 4.0) with FLUX.2-klein-4B (Apache-2.0) as the teacher is about
+as strong, sharper, and meant for commercial use ("A commercially usable student"). Its 640 version without two of
+the transformer's 20 blocks, retrained, keeps its look and runs 8-12 % faster on an RTX 4060 Ti ("Removing transformer
+blocks"), and a face pass draws faces properly where the 640 path smears them ("Faces"). The numbers below say what has
+been measured and how.
 
 ## Demo
 
@@ -47,7 +51,8 @@ embedding fixed, its 8-step output has a warping error of 26.4 on the evaluation
 DreamLite-mobile with its one-step LoRA (table below). The streaming setting fixes the two free inputs:
 
 - one init-noise tensor shared by every frame (a CPU float32 draw, stored with each student), and
-- one instruction embedding per clip, computed from the first frame (Qwen3-VL sees instruction and image together).
+- one instruction embedding per clip, computed from the first frame (Qwen3-VL sees instruction and image together),
+  and again from the first frame after a scene cut when the carry-over detects one.
 
 VIBE's K-step output is then a deterministic function of the frame. A rank-32 LoRA on the transformer is trained to
 reproduce the 8-step output in k = 1 or 2 first-order steps (paired regression: Huber on the latent + LPIPS on
@@ -200,14 +205,22 @@ GeForce Ampere's half-rate fp32 accumulation (e.g. with the gpu-unlock tool) wou
 fp16-accumulating kernels, so it would have added 8-10 % to the loop before taesana moved to TensorRT and next to
 nothing after.
 
+**Host work on a thread.** `StreamEditor.run` used to compute the filter's and the carry-over's DIS flows on the
+stream's own thread between queueing two batches. That overlaps the GPU only while CUDA's launch queue has room for a
+whole batch; when it fills, queueing waits for the GPU and the host work then adds to the batch's time. The flows are
+now computed a batch ahead on a worker thread, as `LiveEditor` does for a live source (same functions, identical
+output bit for bit). On `breakdance` at 640 (INT8 engine, carry-over + filter 0.7 / 0.3) the loop goes from 69.8 to
+75.4 fps, the step-only rate (75.7); with the face pass ("Faces"), whose extra work overfills the launch queue, from 34
+to 56. The loop rates above were measured before this change.
+
 **Delay with a live source.** Offline, a batch's host work (the DIS flows of the filter and the carry-over, about
 15 ms per frame at 768) overlaps the previous batch's GPU work. A live batch can only be staged once its last frame
 has arrived, and staged the same way that host work sat between the last frame and the GPU: 117 + 169 ms per batch
 of 8 at 768, more than the 267 ms a 30 fps camera leaves, so the delay grew without bound at every batch size.
 `vibe_stream.live.LiveEditor` computes each frame's flows on a thread as the frame arrives (`TemporalFilter.host_flow`,
-`Carry.host_flow`) and hands the batch to the GPU as soon as it is complete; with the batch-8 engines its output is
-identical to `StreamEditor.run`'s bit for bit. Delay from a frame's hand-over to its edited copy back on the host,
-`blackswan` handed over at 30 fps in wall-clock time (`scripts/measure_latency.py`), INT8 engines of
+`Carry.host_flow`) and hands the batch to the GPU as soon as it is complete; with the batch-8 engines at 768 its
+output is identical to `StreamEditor.run`'s bit for bit. Delay from a frame's hand-over to its edited copy back on
+the host, `blackswan` handed over at 30 fps in wall-clock time (`scripts/measure_latency.py`), INT8 engines of
 `lam4_carry_s05_lut_2step_768` / `_640` with carry-over + filter 0.7 / 0.3 (the default student's engines are the same
 network at the same speed, "Many instructions"), mean / 95th percentile, two rounds:
 
@@ -222,10 +235,35 @@ A frame waits for the rest of its batch, up to (batch - 1) / 30 s, and then for 
 shortest delay that still keeps up with 30 fps, and batch 4 keeps more headroom (46 fps at 768) for a busier GPU.
 Smaller batches carry the previous output over a shorter distance: warping error 9.93 / 9.57 / 9.57 at 768 and
 9.52 / 9.13 / 9.21 at 640 (batch 8 / 4 / 2), Sobel a little lower (8.98 / 8.90 / 8.82 and 9.21 / 8.98 / 8.95).
-The INT8 engines for batch 4 and 2 are not bit-reproducible from run to run (TensorRT's kernels for their smaller
-matrix products sum in a varying order: now and then one call differs by up to about 0.1 in velocity, which fades
-over the following batches); the batch-8 engines are. Checking this turned up a second source of run-to-run
-variation, now removed: the colour map of the LUT fill was summed with atomic adds (`Carry`'s `fit_colour_map`).
+The INT8 engines for batch 4 and 2 at 768 and for batch 8 at 640 are not bit-reproducible from run to run
+(TensorRT's kernels for their smaller matrix products sum in a varying order: a call can differ by up to about 0.1 in
+velocity, which fades over the following batches; at 640 batch 8 every call does, and two offline runs of a clip
+differ by LPIPS 0.01); the INT8 engines for 768 batch 8 and the fp16 engines are. Checking this turned up a second
+source of run-to-run variation, now removed: the colour map of the LUT fill was summed with atomic adds (`Carry`'s
+`fit_colour_map`).
+
+**Re-embedding at cuts without a stall.** At a cut the instruction is embedded again with the frame after it ("Flicker",
+carry-over), and live the stream waits for it: at 640 on the 3090 Ti (fp16 engine) the cut batch comes out about
+400 ms later than the others (560 against 153 ms from its last frame) and the next one 280 ms. With `StreamEditor(reembed_async=True)`
+(`--reembed_async`; used by `LiveEditor` only, offline the wait costs nothing but throughput) the embedding is made on
+a thread and a high-priority CUDA stream of their own, started by the live host thread as soon as the frame at the cut
+arrives; the cut batch is carried over whole with the old embedding (the frames past the cut start from their fill),
+and the first batch planned after the embedding is ready is a keyframe with it. The face pass embeds its face crop the
+same way. `lam4_carry_s05_lut_2step_640` (fp16 engine), carry-over + filter 0.7 / 0.3, two sequences of three DAVIS
+clips spliced (as above) x oil / anime / ukiyo-e / night, live at 30 fps, LPIPS to each scene streamed on its own:
+
+| At a cut | LPIPS, whole sequence | 16 frames after a cut | Cut batch's frames before it | CLIP direction | Delay, cut batch / next |
+|---|---:|---:|---:|---:|---:|
+| no re-embedding | 0.174 | 0.303 | 0.343 | 0.149 | |
+| re-embedded, waited for | 0.048 | 0.105 | 0.013 | 0.163 | 560 / 440 ms |
+| re-embedded on the side | 0.082 | 0.223 | 0.015 | 0.163 | 200 / 250 ms |
+
+(Delay: from a batch's last frame to its result; the other batches 150 ms.) The embedding is ready one batch after the
+cut on the 3090 Ti, so for the rest of the cut batch the new scene keeps the old instruction's reading, and the
+keyframe that takes it comes a batch later than when waiting; the edit strength over the sequence is the same. On the RTX 4060 Ti, where it takes 0.9-1.2 s
+next to the stream (0.22 s alone) and the GPU has little headroom (37 fps against 30), a cut every 1.5 s (the spliced
+sequence twice over) makes the waiting stream fall behind (mean delay 1.2 s) while the one embedding on the side keeps
+up (0.44 s).
 
 ### Flicker (streaming path)
 
@@ -274,7 +312,12 @@ frame. `lam4_carry` is trained for it (`--w_carry 1`): the student's own output,
 as at run time (and with probability 0.5 carried once more through a frame in between), is the start of a step that
 gets the Huber and LPIPS terms against the teacher and lam times an L1 against the warped output; the usual pair
 terms stay, so its 2-step path still serves keyframes. Keyframes come at the start and at cuts (detected from the
-flow, `Carry.cut_below`); the runs below have no other keyframes. With `--carry_fill lut` what fills in where the
+flow, `Carry.cut_below`); the runs below have no other keyframes. At a cut the instruction is embedded again with the
+frame after it (`StreamEditor(reembed_at_cut=True)`, the default): a keyframe follows the embedding closely, and the
+first frame's paints the old scene into the new one. The frames of that batch before the cut are carried over with
+the old embedding in a pass of their own. On spliced DAVIS clips at 640, LPIPS to each scene run on its own is 0.30
+without and 0.10 with over the 16 frames after a cut, 0.34 and 0.01 over the frames before it in the cut batch; a cut
+costs one embedding (170 ms on the 3090 Ti) and one transformer call. With `--carry_fill lut` what fills in where the
 flow does not hold is the frame passed through a colour map fitted at the keyframe instead of the frame itself (last
 point below).
 
@@ -529,6 +572,158 @@ Values for trained / held-out instructions:
   and `libby`, carry-over + filter 0.7 / 0.3 (LPIPS on the 2-step path): CLIP direction
   0.177 / 0.178, flicker 6.59 / 6.61, LPIPS to teacher 0.219 / 0.217.
 
+### A commercially usable student
+
+The students above learn from DAVIS-2017 clips, which the DAVIS site lists under CC BY-NC 4.0 (see
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)); weights that can be used commercially were the reason to move from
+DreamLite to VIBE. `klein_sav_vnight_cont_768` is trained on clips from Meta's
+[SA-V](https://ai.meta.com/datasets/segment-anything-video/) (CC BY 4.0) with
+[FLUX.2-klein-4B](https://huggingface.co/black-forest-labs/FLUX.2-klein-4B) (Apache-2.0) as the teacher, from no
+DAVIS-trained weights:
+
+- Windows (`sav_probe.py`, `sav_windows.py`): 200 windows of 10 frames drawn from 1841 SA-V clips (two of its
+  archives: 24 fps, 10-19 s, 72 % portrait; centre-cropped to a square), from clips with a median motion of 1.5-30 px
+  per two frames at 768; the 72 drawn from clips slower than 5 px take every second frame.
+- Teacher (`klein_teacher.py`): Klein, 4 steps, every frame edited on its own, 5 of the 14 training instructions per
+  window (31 s per window x instruction at 768, 8 h in all). Of the Apache-2.0 editing models tried as teachers on the
+  evaluation clips, Klein scored the highest CLIP direction (0.192, VIBE's 8-step output 0.183) with sharper texture
+  and was the only one fast enough for bulk data (3.0 s per frame at 768; Qwen-Image-Edit-2511 with a 4-step LoRA
+  15 s, LongCat-Image-Edit 164 s). It reads some instructions differently from VIBE: its oil painting is garish, its
+  pastel washes out and its ukiyo-e comes with a border, text and a seal, so these three get the wordings in
+  `presets.KLEIN_PROMPTS` (the seal and the text go, a thin border may stay).
+- Training: the recipe of `multi_carry_s05_lut_2step_768` from scratch, 4000 steps (3.7 s/step); windows hold only
+  their own instructions and `train_student.py` samples the (window, instruction) pairs present. Klein's night turns
+  indoor scenes into streets at night, so a second round takes night from VIBE's teacher (`repack_keys.py --keys
+  night`, 71 windows) and trains 4000 more steps.
+
+`scripts/eval_student_stream.py` (PyTorch path, the four evaluation clips played forward then backward, 96 frames;
+oil, anime, ukiyo-e and night, and the held-out gouache and autumn; carry-over + filter 0.85 / 0.5; *Edge*: edge
+agreement with the input):
+
+| Student | Path | CLIP dir | Worst batch | Flicker | Warp | Sobel | Edge |
+|---|---|---:|---:|---:|---:|---:|---:|
+| `multi_carry_s05_lut_2step_768` (DAVIS, VIBE teacher) | 2 steps | 0.170 | 0.142 | 13.20 | 15.80 | 7.01 | 0.379 |
+| | carry-over + filter | 0.167 | 0.135 | 5.66 | 9.14 | 5.65 | 0.629 |
+| SA-V + Klein, round 1 | 2 steps | 0.160 | 0.130 | 10.34 | 14.46 | 11.89 | 0.633 |
+| | carry-over + filter | 0.161 | 0.129 | 6.44 | 10.65 | 9.25 | 0.727 |
+| `klein_sav_vnight_cont_768` (round 2) | 2 steps | 0.157 | 0.129 | 10.32 | 14.25 | 11.73 | 0.590 |
+| | carry-over + filter | 0.162 | 0.130 | 6.62 | 10.78 | 9.47 | 0.709 |
+
+- Sharper (Sobel 9.5 against 5.7 on the carry-over path) and closer to the input's structure (edge agreement 0.71
+  against 0.63), with natural colours: anime is no longer washed out, the autumn pond no longer red. A little less
+  edit strength (0.162 against 0.167) and 17 % more flicker (6.62 against 5.66), which goes with the texture.
+- Weaker where Klein is: ukiyo-e keeps the photo's colours. The second round makes night real night (CLIP direction
+  0.131 to 0.141; the DAVIS student 0.150) and steadier (night's flicker 2.08 to 1.41); the other instructions move
+  little (oil 0.201 to 0.195, autumn 0.142 to 0.149).
+- DC-AE does not reproduce Klein's texture exactly (round trip 19 dB PSNR, VIBE's own outputs 28 dB), but the decoded
+  targets look the same: texture is re-synthesised, not lost.
+
+### Removing transformer blocks
+
+On smaller GPUs the transformer is most of the frame time, and each of its 20 blocks costs about 5 % of it. Removing
+blocks without retraining changes the output visibly: any single block removed on both steps gives LPIPS 0.14-0.29
+to the full student (block 0 is essential), and removed on the carried step only, two blocks still give 0.07 or more
+(14 and 18: 0.076), while the keyframes, which every carried frame follows, should not lose quality either. So blocks
+14 and 18 are removed everywhere and the student is retrained without them (`VibeModel(remove_blocks=...)`,
+`train_student.py --remove_blocks 14,18`; the student records them, and `build_trt.py` exports an engine without
+them):
+
+- `klein640_prune14_18`: the round-2 student copied to 640 (`resize_student.py`: the LoRA unchanged, the init noise
+  centre-cropped), then 4000 steps at 640 without blocks 14 and 18 (3.2 s/step, 3.6 h) on a 640 pack
+  (`resize_pack.py`): the SA-V windows with Klein's targets resized, and per window 3 of 25 broad instructions
+  (`presets.BROAD_PROMPTS`: 3D cartoon, pixel art, ink wash, cyberpunk, rain, VHS, ...) with the full 640 student's
+  own outputs as targets, so that the pruned student keeps what the full one does beyond its 14 instructions.
+- `scripts/eval_pruned.py` (carry-over + filter 0.7 / 0.3, the four evaluation clips, 32 frames, nine instructions of
+  which four held out): LPIPS to the full 640 student 0.142 with the blocks just removed, 0.070 after retraining. Every
+  instruction halves, night (0.134 to 0.062) and the held-out ones too (crayon 0.200 to 0.083, fog 0.152 to 0.072). CLIP
+  direction 0.173 full, 0.164 removed, 0.170 retrained; fog loses most (0.188 to 0.172). A first retraining on the
+  two-instruction DAVIS pack reached only 0.109 and made night worse (0.127 to 0.157): retrain on a broad set.
+- `eval_student_stream.py` at 640, carry-over + filter: CLIP direction 0.157, flicker 6.23, Sobel 9.06 without the two
+  blocks, 0.159 / 6.58 / 10.09 with them.
+- INT8 engine (1.57 GB): its stream output is LPIPS 0.007 (40 dB) from the PyTorch path's, with the same CLIP direction
+  and flicker. On an RTX 4060 Ti the transformer goes from 21.4 to 19.2 ms per frame, and the 640 path with carry-over
+  + filter from 33.1 to 36.0 fps (`blackswan`), 37.2 with the filter's and the carry-over's smooth parts at reduced
+  resolution (`--fast_post`: 38-40 dB from the full-resolution output, the same flicker, 0.9 instead of 1.3 ms per
+  frame on the 3090 Ti).
+
+### 8 GB GPUs
+
+On an RTX 4060 (8 GB) the plain setup runs out of memory: Qwen3-VL in bf16 (4.0 GB), VIBE's PyTorch transformer and
+DC-AE next to the engine, and a scratch buffer per TensorRT context (taesana's batch-8 decoder alone 1.2 GB at 640).
+What makes it fit, all options of `stream_video.py` with `--engine` and `--tae_engine`:
+
+- `--low_vram`: the transformer blocks and DC-AE stay on the CPU (`VibeModel(denoiser_on_gpu=False)`); only the
+  modules the instruction embedding runs through go to the GPU.
+- `--te_bits 8`: Qwen3-VL's language model HQQ 8-bit weight-only (group 64), resident (2.1 instead of 4.0 GB), its
+  token table on the CPU (an exact lookup) and its lm_head dropped. The embedding moves by 12 %, the output by LPIPS
+  0.014 on average (0.049 at most) over four clips x six instructions, about what computing the embedding in fp32
+  instead of bf16 does; `--te_vision_bits` quantizes the vision tower too (37.6 dB from the output without, one clip).
+  4 bits is visibly off (LPIPS 0.10-0.13), and swapping a bf16 encoder in for each embedding (`--low_vram` alone)
+  peaks above 9 GB.
+- `--share_scratch`: one TensorRT scratch buffer for the engines, which run in turn on one stream.
+- `--tae_dec_engine` with taesana engines for batch 4 (`build_trt_tae.py --batch 4`): the decoder called twice per
+  batch, 42.7 dB from the batch-8 decoder's output, at the same speed.
+- `--swap_edit_head`: VIBE's edit head (0.5 GB) on the GPU only while an instruction is embedded.
+- `build_trt.py --low_vram`: engines built on the 8 GB card itself (export peak 5.8 GB at 640, 6.6 at 768; the
+  TensorRT build 2.3 GB).
+
+On a rented RTX 4060 8 GB (Linux, 115 W), 640 with carry-over + filter and the DAVIS 640 student's INT8 engine: out of
+memory with Qwen3-VL in HQQ 8-bit alone, 7.33 GB at the peak with the shared scratch (28.6 fps), 6.75 GB with the
+batch-4 decoder, 6.21 GB with the edit head swapped and 5.37 GB with the vision tower quantized, all at 28.5 fps;
+768 at best 5.66 GB and 19.9 fps, not real time. With transformer blocks 14 and 18 removed ("Removing transformer
+blocks") and `--fast_post`, 640 runs at 31.4 fps there (28.3 without either). These runs used the same mechanisms
+patched into the code before they became the options above. The options themselves, on an RTX 4060 Ti (16 GB, so
+nothing runs out; `klein640_prune14_18` INT8, carry-over + filter 0.7 / 0.3, `breakdance` cycled to 240 frames), in
+use on the device after a run: 13.3 GB plain, 7.8 with `--low_vram --te_bits 8`, 7.4 with the shared scratch, 6.8
+with the batch-4 decoder and 6.2 with the edit head swapped, at 35.8-37.1 fps throughout (37.0 with `--fast_post`
+alone, 35.8 without). Live at a 30 fps source, `blackswan` comes out 350 / 464 ms late (mean / 95th percentile). A
+cut costs about 0.22 s of re-embedding there (0.17 s on the 3090 Ti) and the extra pass; with 37 fps against 30 there
+is little room to catch up, and with a cut every 1.5 s (three DAVIS clips spliced, twice over) the delay grows to
+1.2 s on average, against 0.44 s when the embedding is made on the side (Speed, "Re-embedding at cuts without a
+stall").
+
+### Faces
+
+At 640 a face 20-60 px wide covers one or two of the transformer's 32-pixel latent tokens. The 2-step student cannot
+draw a face on so few tokens: eyes and mouth come out as blotches, and since the flow the carry-over and the filter
+follow fails on a turning, talking face, they are redrawn on every frame, which reads as noise crawling over the face.
+The 8-step teacher does no better at that size, and 768 or the filter help little. Transferring the input face's
+detail into the output steadies it but leaves a blurred photograph inside a drawing.
+
+The face pass (`vibe_stream.face`, `--face_engine`) edits the main face again: a square of 2.6 face widths around it,
+brought to 256, where the face covers about three tokens and the same student draws a proper face in the style. Per
+frame, YuNet (OpenCV's face detector) finds the faces on the frame at 384 px and a causal tracker follows the widest;
+the crops, a video of the face held in place, go through a second `StreamEditor` at 256 with its own carry-over and
+filter, and are pasted back on the GPU inside a feathered ellipse with their colours below half a face width taken
+from the main output. The instruction is embedded again with a face crop once per clip and per cut: with the whole
+frame's embedding the crop editor draws darker, half-photographic faces.
+
+On the 640 path (`klein640_prune14_18`, INT8, carry-over + filter 0.7 / 0.3) with a 256 INT8 engine of
+`klein_sav_vnight_cont_768` (`resize_student.py --size 256`), 11 clip x instruction pairs from 6 DAVIS clips with
+people: the frame-to-frame change of the face region's high band (against the previous frame's warped along the
+input's flow, where that flow holds) drops from 9.8 to 5.6 (the input's own: 3.2), and the faces are drawn instead of
+blotched. The eyes and brows still move a little. On an RTX 3090 Ti (`breakdance`) it costs 4.7 ms per frame on the
+GPU (loop 75 to 58 fps), one more text-encoder run per clip (about 160 ms) and a second copy of the transformer's
+weights (1.9 GB in INT8); live at a 30 fps source the delay goes from 243 / 360 to 284 / 400 ms (mean / 95th
+percentile). YuNet runs as a TensorRT engine (`build_trt_yunet.py`, 4.4 ms per frame at 640 on an idle GPU, the same
+faces as OpenCV's) or through OpenCV on the host (11 ms at 384); either way detection, crops and their flows run on a
+thread beside the stream. Which is faster depends on the GPU's headroom: on the 3090 Ti the engine (loop 57.0 against
+50.6 fps with OpenCV), on an RTX 4060 Ti, whose GPU is the bottleneck, OpenCV (29.9 against 25.9 fps: the engine's
+small kernels wait behind the stream's, 34 ms a frame, even on a high-priority stream). There the face pass costs 6.4
+ms per frame on the GPU (step-only 36.1 to 29.3 fps, and the loop as fast with OpenCV's detector).
+
+A second engine for the crops holds a second copy of the transformer's weights (1.9 GB). The stream's own student
+draws faces at 256 as well as the 768 one (`klein640_prune14_18`, copied to 256, on the same crops), so one engine can
+do both: `build_trt.py --extra_sizes 256` exports it with the latent's size dynamic and builds an optimization profile
+per size on one copy of the weights (1.57 GB), and `--face_engine main` runs the face pass on the 256 profile. On the
+3090 Ti, its 640 profile is as accurate and as fast as the static engine (77.4 fps loop with the 8 GB options) and the
+face change comes out the same (5.45 against 5.59); with the 8 GB options the face pass then adds 0.2 GB instead of
+1.9 (RTX 4060 Ti: 6.29 against 8.03 GB in use), which brings it within an 8 GB card. Its cost on such a card stays
+the 6 ms per frame above. (Speed on the 4060 Ti could not be compared further: that card slowed from 32 to 21 fps over
+four runs in a row of the same setup that afternoon; the engines alone, timed at build, take 148.6 and 151.9 ms per
+call.) It depends on the student: the DAVIS `multi_carry_s05_lut_2step_768` at 256 draws hollow eyes and blurred
+faces. One face per frame; crowds keep theirs.
+
 ## Setup
 
 The code expects an upstream VIBE checkout next to it (or `VIBE_REPO` pointing at one) and the weights in `models/`:
@@ -545,6 +740,13 @@ beyond these are not needed; when `loguru` is missing a silent stand-in is used.
 here, 2.6).
 
 Video clips are not tracked; see [assets/README.md](assets/README.md).
+
+The face pass needs OpenCV's YuNet face detector (MIT) in `models/`:
+
+```bash
+curl -L -o models/face_detection_yunet_2023mar.onnx \
+    https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx
+```
 
 ## Usage
 
@@ -634,6 +836,49 @@ python scripts/stream_video.py --input ... --engine out/trt/vibe_refs_carry_s05_
 # ... its INT8 engine: the reference prompts are calibrated on reference images (--calib_refs, by default the list above)
 python scripts/build_trt.py --student runs/refs_carry_s05_lut_2step_768/lora.safetensors \
     --engine out/trt/vibe_refs_carry_s05_lut_2step_768_b8_int8.engine --int8
+
+# The commercially usable students. SA-V: accept Meta's terms on its page and extract sav_000 and sav_001 into
+# data/sav/videos; Klein runs under an interpreter whose diffusers has Flux2KleinPipeline
+python scripts/sav_probe.py --root data/sav/videos --out data/sav/probe.csv
+python scripts/sav_windows.py --probe data/sav/probe.csv --videos data/sav/videos --out data/sav_windows --n 200
+python scripts/klein_teacher.py --windows data/sav_windows --out data/sav_klein                         # ~8 h
+python scripts/pack_klein.py --windows data/sav_windows --klein data/sav_klein --out data/teacher_sav_768
+python scripts/train_student.py --data data/teacher_sav_768 --run runs/klein_sav_carry_s05_lut_2step_768 \
+    --student_steps 2 --lam 4 --w_carry 1 --carry_sigma 0.5 --carry_fill lut --grad_ckpt --steps 4000   # ~4.1 h
+python scripts/repack_keys.py --src data/teacher_sav_768 --out data/teacher_sav_768_vnight --keys night
+python scripts/train_student.py --data data/teacher_sav_768_vnight --run runs/klein_sav_vnight_cont_768 \
+    --student_steps 2 --lam 4 --w_carry 1 --carry_sigma 0.5 --carry_fill lut --grad_ckpt --steps 4000 \
+    --init runs/klein_sav_carry_s05_lut_2step_768/lora.safetensors
+python scripts/eval_student_stream.py --name klein_sav2 --student runs/klein_sav_vnight_cont_768/lora.safetensors
+# ... at 640 without blocks 14 and 18: the student copied to 640, a 640 pack with broad instructions self-distilled
+# from that copy, 4000 steps (~3.6 h), its INT8 engine, streamed with the cheaper post-processing
+python scripts/resize_student.py runs/klein_sav_vnight_cont_768/lora.safetensors \
+    runs/klein_sav_vnight_cont_768/lora_640.safetensors --size 640
+python scripts/resize_pack.py --mode klein --src data/teacher_sav_768_vnight --klein data/sav_klein \
+    --out data/teacher_sav_640
+python scripts/resize_pack.py --mode self --src data/teacher_sav_768_vnight --out data/teacher_sav_640 \
+    --teacher runs/klein_sav_vnight_cont_768/lora_640.safetensors
+python scripts/train_student.py --data data/teacher_sav_640 --run runs/klein640_prune14_18 --student_steps 2 --lam 4 \
+    --w_carry 1 --carry_sigma 0.5 --carry_fill lut --grad_ckpt --steps 4000 --remove_blocks 14,18 \
+    --init runs/klein_sav_vnight_cont_768/lora_640.safetensors
+python scripts/eval_pruned.py --student runs/klein_sav_vnight_cont_768/lora_640.safetensors \
+    --healed runs/klein640_prune14_18/lora.safetensors --blocks 14,18 --tae_engine out/trt/taesana_640_b8 \
+    --keys oil anime ukiyoe night winter gouache crayon autumn fog --out out/eval_pruned/klein640.json
+python scripts/build_trt.py --student runs/klein640_prune14_18/lora.safetensors \
+    --engine out/trt/vibe_klein640_prune14_18_b8_int8.engine --int8
+python scripts/stream_video.py --input ... --engine out/trt/vibe_klein640_prune14_18_b8_int8.engine \
+    --tae_engine out/trt/taesana_640_b8 --carry --temporal_filter 0.7 0.3 --fast_post
+# Face pass: the stream's engine with a second profile at 256 (one copy of the weights), taesana at 256, YuNet (Setup)
+# as an engine (faster where the GPU has headroom) or its ONNX file run by OpenCV on the host (where it has none)
+python scripts/build_trt.py --student runs/klein640_prune14_18/lora.safetensors \
+    --engine out/trt/vibe_klein640_prune14_18_b8_int8_dyn.engine --int8 --extra_sizes 256
+python scripts/build_trt_tae.py --size 256 --prefix out/trt/taesana_256_b8
+python scripts/build_trt_yunet.py --onnx models/face_detection_yunet_2023mar.onnx --engine out/trt/yunet_640.engine
+python scripts/stream_video.py --input ... --engine out/trt/vibe_klein640_prune14_18_b8_int8_dyn.engine \
+    --tae_engine out/trt/taesana_640_b8 --carry --temporal_filter 0.7 0.3 \
+    --face_engine main --face_tae_engine out/trt/taesana_256_b8 --face_model out/trt/yunet_640.engine
+# ... or a separate engine for the crops (another student, e.g. the 768 one copied to 256 with resize_student.py)
+python scripts/stream_video.py --input ... --face_engine out/trt/vibe_klein_face_256_b8_int8.engine ...
 ```
 
 A student is tied to its resolution and its init noise (stored in the file). Other instructions than the ones it was
@@ -658,6 +903,8 @@ a mismatch is refused.
   - `live.py`: the same for frames arriving one at a time, host flows computed as they arrive
   - `temporal_filter.py`: display-side two-band temporal filter
   - `carry.py`: carry-over of the previous output into the next batch's start
+  - `face.py`: face pass (detection, tracking, the face crop edited at 256 and pasted back)
+  - `presets.py`: instructions (also Klein's wordings and the broad self-distilled set) and clip sets
   - `state_attn.py`: self-attention state carried from frame to frame (experimental, Negative results)
   - `metrics.py`: video I/O, warping error, flicker split, Sobel, edge agreement, LPIPS, CLIP scores
 - `scripts/`: one entry point per step above.

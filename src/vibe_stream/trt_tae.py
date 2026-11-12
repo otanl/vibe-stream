@@ -117,20 +117,30 @@ class _Runner:
 
 class TRTTinyAutoencoder:
     """`TinyAutoencoder`'s interface on the two engines, on the current CUDA stream. Each call returns a new tensor
-    (the streaming loop keeps several encodings of one batch alive at once)."""
+    (the streaming loop keeps several encodings of one batch alive at once).
 
-    def __init__(self, prefix, device: str = "cuda"):
+    `dec_prefix`: the decoder from engines of a smaller batch that divides this one (e.g. built with --batch 4),
+    called once per part of the batch: its scratch memory is a fraction of the batch-8 decoder's (1.2 GB at 640), at
+    42.7 dB from the batch-8 output and the same speed (README, "8 GB GPUs")."""
+
+    def __init__(self, prefix, device: str = "cuda", dec_prefix=None):
         import tensorrt as trt
         self.spec = TaeSpec.load(prefix)
-        if self.spec.tensorrt != trt.__version__ or self.spec.platform != sys.platform:
-            raise RuntimeError(f"{prefix} was built with TensorRT {self.spec.tensorrt} on {self.spec.platform}; "
-                               f"this is TensorRT {trt.__version__} on {sys.platform}")
+        specs = [self.spec] + ([TaeSpec.load(dec_prefix)] if dec_prefix else [])
+        for sp, p in zip(specs, (prefix, dec_prefix)):
+            if sp.tensorrt != trt.__version__ or sp.platform != sys.platform:
+                raise RuntimeError(f"{p} was built with TensorRT {sp.tensorrt} on {sp.platform}; "
+                                   f"this is TensorRT {trt.__version__} on {sys.platform}")
         self.device = torch.device(device)
         self.size, self.batch = self.spec.size, self.spec.batch
+        self.dec_batch = specs[-1].batch
+        if specs[-1].size != self.size or self.batch % self.dec_batch:
+            raise ValueError(f"decoder engines for batch {self.dec_batch} at {specs[-1].size} do not divide batch "
+                             f"{self.batch} at {self.size}")
         self._log = trt.Logger(trt.Logger.WARNING)
         rt = trt.Runtime(self._log)
         self.enc = _Runner(rt, engine_path(prefix, "enc"))
-        self.dec = _Runner(rt, engine_path(prefix, "dec"))
+        self.dec = _Runner(rt, engine_path(dec_prefix or prefix, "dec"))
 
     def _check(self, shape, want):
         if tuple(shape) != want:
@@ -147,7 +157,10 @@ class TRTTinyAutoencoder:
     @torch.inference_mode()
     def decode_u8(self, lat: torch.Tensor) -> torch.Tensor:
         """Scaled latents -> (B, H, W, 3) uint8 on the GPU."""
-        n = self.batch
+        n, d = self.batch, self.dec_batch
         self._check(lat.shape, (n, 32, self.size // 32, self.size // 32))
         out = torch.empty((n, self.size, self.size, 3), dtype=torch.uint8, device=self.device)
-        return self.dec(lat.to(torch.float16).contiguous(), out, ("lat", "frames"), self.device)
+        lat = lat.to(torch.float16).contiguous()
+        for i in range(0, n, d):
+            self.dec(lat[i:i + d], out[i:i + d], ("lat", "frames"), self.device)
+        return out

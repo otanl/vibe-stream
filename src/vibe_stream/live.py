@@ -8,10 +8,23 @@ GPU: 117 ms per batch of 8 at 768, which with the GPU's 169 ms exceeds the 267 m
 delay grows without bound. `LiveEditor` computes each frame's flows on a thread as the frame arrives
 (`TemporalFilter.host_flow`, `Carry.host_flow`; the carry-over's reference, the previous batch's last frame, is known
 by then), so only the last frame's flows lie between it and the GPU. It runs the same operations as
-`StreamEditor.run` on the same frames; with the batch-8 engines the output is identical bit for bit. The INT8 engines
-for batch 4 and 2 are not bit-reproducible even from one offline run to the next: TensorRT's kernels for their
-smaller matrix products sum in a varying order, so now and then one transformer call differs by up to about 0.1 in
-velocity, and the difference fades over the following batches.
+`StreamEditor.run` on the same frames; with the fp16 engines and the INT8 ones for 768 batch 8 the output is identical
+bit for bit, also across a cut where the instruction is embedded again. The other INT8 engines (768 batch 4 and 2, 640
+batch 8) are not bit-reproducible even from one offline run to the next: TensorRT's kernels for their smaller matrix
+products sum in a varying order, so a transformer call can differ by up to about 0.1 in velocity, and the difference
+fades over the following batches. At 640 batch 8 that happens on every call (LPIPS between two offline runs of a clip
+about 0.01).
+
+With a face pass (`vibe_stream.face`), its host work (face detection, the face crops and their flows, about 15 ms per
+frame) runs on a second thread beside the first.
+
+At a cut the instruction is embedded again on the thread that calls `step` (`StreamEditor.reembed_at_cut`), and the
+frames before the cut get a pass of their own: at 640 on an RTX 3090 Ti that holds the cut batch back by about 290 ms
+and the next one by about 230 ms. With `StreamEditor(reembed_async=True)` nothing waits: the host thread starts the
+embedding on the side as soon as the frame at the cut arrives (`SideEmbedding`), the cut batch is carried over with
+the old embedding, and the first batch planned after the new one is ready (`StreamEditor.side_check`) is a keyframe
+with it (README, "Re-embedding at cuts without a stall"). Live output is then no longer identical to `run`'s, which
+waits.
 
     live = LiveEditor(editor)          # after editor.set_prompt(...)
     live.start()
@@ -33,7 +46,7 @@ from typing import List, Optional
 import numpy as np
 import torch
 
-from .stream import StreamEditor
+from .stream import SideEmbedding, StreamEditor
 
 
 class LiveEditor:
@@ -43,17 +56,21 @@ class LiveEditor:
         self._in: queue.Queue = queue.Queue()
         self._ready: queue.Queue = queue.Queue()
         self._thread: Optional[threading.Thread] = None
+        self._face_thread: Optional[threading.Thread] = None
         self._pin_in = self._pin_out = None
         self._done = torch.cuda.Event()
 
     def start(self) -> None:
-        """Begin a clip: the temporal filter and the carry-over start afresh, and the host thread starts."""
-        for state in (self.ed.tfilter, self.ed.carry):
-            if state is not None:
-                state.reset()
+        """Begin a clip: the temporal filter and the carry-over start afresh (`StreamEditor.reset_clip`), and the host
+        thread starts."""
+        self.ed.reset_clip()
         self._in, self._ready = queue.Queue(), queue.Queue()
+        self._face_in, self._face_ready = queue.Queue(), queue.Queue()
         self._thread = threading.Thread(target=self._host, daemon=True)
         self._thread.start()
+        if self.ed.face is not None:
+            self._face_thread = threading.Thread(target=self._face_host, daemon=True)
+            self._face_thread.start()
 
     def submit(self, frame: np.ndarray) -> None:
         """One arriving frame, RGB uint8 (H, W, 3) at the editor's size. Returns at once."""
@@ -62,17 +79,20 @@ class LiveEditor:
     def stop(self) -> None:
         """End the clip; `step` returns None once the complete batches before it are out."""
         self._in.put(None)
-        if self._thread is not None:
-            self._thread.join()
-            self._thread = None
+        for t in (self._thread, self._face_thread):
+            if t is not None:
+                t.join()
+        self._thread = self._face_thread = None
 
     def _host(self) -> None:
-        tf, cr, B = self.ed.tfilter, self.ed.carry, self.batch_size
+        tf, cr, fp, B = self.ed.tfilter, self.ed.carry, self.ed.face, self.batch_size
         ref = None
         while True:
-            frames, tfl, grays, res = [], [], [], []
+            frames, tfl, grays, res, early = [], [], [], [], None
             for _ in range(B):
                 f = self._in.get()
+                if fp is not None:
+                    self._face_in.put(f)
                 if f is None:
                     self._ready.put(None)
                     return
@@ -82,9 +102,26 @@ class LiveEditor:
                 if cr is not None:
                     grays.append(cr.gray(f))
                     res.append(cr.host_flow(grays[-1], ref))
+                    if early is None and self.ed.reembed_async and res[-1] is not None and not res[-1][1]:
+                        # the frame at a cut (`Carry.plan` will find the same one): its embedding starts on the side
+                        # now, not once the rest of the batch has arrived
+                        early = (len(frames) - 1, SideEmbedding(self.ed._make_embedding, f.copy(), self.ed.side_stream))
             if cr is not None:
                 ref = grays[-1]
-            self._ready.put((frames, tfl if tf is not None else None, (grays, res) if cr is not None else None))
+            self._ready.put((frames, tfl if tf is not None else None, (grays, res) if cr is not None else None, early))
+
+    def _face_host(self) -> None:
+        """The face pass's host work (detection, crops, their flows) on a thread of its own, beside `_host`."""
+        fp, B = self.ed.face, self.batch_size
+        while True:
+            items = []
+            for _ in range(B):
+                f = self._face_in.get()
+                if f is None:
+                    self._face_ready.put(None)
+                    return
+                items.append(fp.host_frame(f))
+            self._face_ready.put(fp.host_end(items))
 
     @torch.inference_mode()
     def step(self) -> Optional[List[np.ndarray]]:
@@ -93,8 +130,10 @@ class LiveEditor:
         item = self._ready.get()
         if item is None:
             return None
-        frames, tfl, carry_host = item
+        frames, tfl, carry_host, early = item
         ed = self.ed
+        ed.early_side = early
+        face_host = self._face_ready.get() if ed.face is not None else None
         h, w = frames[0].shape[:2]
         if self._pin_in is None or self._pin_in.shape[1:3] != (h, w):
             self._pin_in = torch.empty((self.batch_size, h, w, 3), dtype=torch.uint8).pin_memory()
@@ -105,8 +144,11 @@ class LiveEditor:
         ed.stream.wait_stream(torch.cuda.current_stream(ed.device))
         with torch.cuda.stream(ed.stream):
             flows = ed.tfilter.flows(arr, tfl) if ed.tfilter is not None else None
+            if ed.reembed_async:
+                ed.side_check()
             plan = ed.carry.plan(arr, carry_host) if ed.carry is not None else None
-            out = ed.process(self._pin_in.to(ed.device, non_blocking=True), flows, plan)
+            face = ed.face.stage(arr, face_host) if ed.face is not None else None
+            out = ed.process(self._pin_in.to(ed.device, non_blocking=True), flows, plan, face, host=arr, live=True)
             self._pin_out.copy_(out, non_blocking=True)
             self._done.record()
         self._done.synchronize()

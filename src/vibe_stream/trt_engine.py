@@ -14,6 +14,12 @@ records them together with the student it was built from (and the student's `car
 The cross-attention projects its K / V from the context once per call, not once per frame
 (`SharedContextAttnProcessor`): the streaming editor gives every frame of a batch the same instruction.
 
+An engine exported with `extra_sizes` (e.g. 256 for the face pass) has the latent's height and width dynamic and one
+optimization profile per size, all on one copy of the weights: `TRTTransformer(engine, size=256, share=main)` runs the
+second profile in a context of its own, with the init noise centre-cropped as `scripts/resize_student.py` does. For
+the pruned Klein 640 student the engine stays 1.58 GB (two engines: 3.43 GB), its 640 profile is as accurate (velocity
+2.5 % from bf16) and no slower than the static engine, and the 256 one is 3.4 % from the student at 256 in PyTorch.
+
 Measured on an RTX 3090 Ti with TensorRT 10.16 at 768, batch 8: 2.98 GB engine built in 100 s, velocity within
 1.3-2.0 % of bf16 PyTorch, 18.8 ms per frame per step (21.3 with K / V per frame; bf16 PyTorch eager: 36 ms).
 """
@@ -52,6 +58,8 @@ class EngineSpec:
     carry_fill: Optional[str] = None      # and what it was trained to fill in with where the flow fails
     precision: str = "fp16"               # or "int8" (vibe_stream.trt_int8)
     shared_context: bool = False          # cross-attention K / V from the first row only (SharedContextAttnProcessor)
+    removed_blocks: Optional[List[int]] = None   # transformer blocks the graph has no layers for (VibeModel)
+    profiles: Optional[List[int]] = None  # sizes of the optimization profiles of a dynamic-size engine, `size` first
 
     @staticmethod
     def path_for(engine) -> Path:
@@ -131,10 +139,11 @@ class _Graph(nn.Module):
 
 
 def export(model: VibeModel, student, engine, batch: int, img_lat: torch.Tensor, emb: torch.Tensor,
-           quantize=None) -> None:
+           quantize=None, extra_sizes=()) -> None:
     """Stage 1. `img_lat` (batch, 32, h, w) and `emb` (1, L, D) are real inputs for the check file. `quantize`, if
     given, takes the fp16 graph, the scaled timesteps and the sigmas and returns the quantized module to export
-    (`trt_int8`).
+    (`trt_int8`). `extra_sizes`: further sizes the engine runs at (one optimization profile each, module docstring);
+    the graph is then exported with the latent's height and width dynamic.
 
     Modifies `model.tr` in place (LoRA merged, projection removed, fp16); the model is not usable afterwards.
     """
@@ -143,6 +152,8 @@ def export(model: VibeModel, student, engine, batch: int, img_lat: torch.Tensor,
     k = int(meta.get("student_steps", 1))
     if int(meta.get("size", model.size)) != model.size:
         raise ValueError(f"student trained at {meta['size']}, exporting at {model.size}")
+    if "removed_blocks" in meta and sorted(meta["removed_blocks"]) != model.removed_blocks:
+        raise ValueError(f"student trained without blocks {meta['removed_blocks']}, model without {model.removed_blocks}")
     noise = state.get(lora_mod.NOISE_KEY)
     if noise is not None:
         model.noise = noise.to(model.device, torch.float32)
@@ -191,7 +202,8 @@ def export(model: VibeModel, student, engine, batch: int, img_lat: torch.Tensor,
                student_sha256=sha256(student), student_steps=k, timesteps=[float(t[0]) for t in tsc], sigmas=sg,
                prompts=meta.get("prompts", {}), carry_sigma=meta.get("carry_sigma"),
                carry_fill=meta.get("carry_fill"), precision="fp16" if quantize is None else "int8",
-               shared_context=True).save(engine)
+               shared_context=True, removed_blocks=model.removed_blocks or None,
+               profiles=[model.size] + [int(x) for x in extra_sizes] if extra_sizes else None).save(engine)
     onnx = onnx_path(engine)
     onnx.parent.mkdir(parents=True, exist_ok=True)
     t0 = time.perf_counter()
@@ -199,12 +211,14 @@ def export(model: VibeModel, student, engine, batch: int, img_lat: torch.Tensor,
     with torch.inference_mode() if quantize is None else torch.no_grad():
         torch.onnx.export(graph, (torch.cat([xs[0], img_lat], 1).half(), enc16, tsc[0]), str(onnx),
                           input_names=["x", "enc", "t"], output_names=["v"], opset_version=17 if quantize is None else 19,
-                          do_constant_folding=True, dynamo=False)
+                          do_constant_folding=True, dynamo=False,
+                          dynamic_axes={"x": {2: "h", 3: "w"}, "v": {2: "h", 3: "w"}} if extra_sizes else None)
     print(f"[export] {onnx} written in {time.perf_counter() - t0:.0f} s", flush=True)
 
 
-def build_onnx(onnx, engine, workspace_gb: float = 6.0) -> str:
-    """A strongly typed engine from an ONNX graph; returns the TensorRT version."""
+def build_onnx(onnx, engine, workspace_gb: float = 6.0, profiles=None) -> str:
+    """A strongly typed engine from an ONNX graph; returns the TensorRT version. `profiles`: {input: shape} per
+    optimization profile, for the graph's dynamic inputs."""
     import tensorrt as trt
     engine = Path(engine)
     log = trt.Logger(trt.Logger.WARNING)
@@ -215,6 +229,11 @@ def build_onnx(onnx, engine, workspace_gb: float = 6.0) -> str:
         raise RuntimeError("; ".join(str(parser.get_error(i)) for i in range(parser.num_errors)))
     cfg = builder.create_builder_config()
     cfg.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, int(workspace_gb * (1 << 30)))
+    for shapes in profiles or []:
+        prof = builder.create_optimization_profile()
+        for name, shape in shapes.items():
+            prof.set_shape(name, shape, shape, shape)
+        cfg.add_optimization_profile(prof)
     t0 = time.perf_counter()
     blob = builder.build_serialized_network(net, cfg)
     if blob is None:
@@ -228,27 +247,50 @@ def build_onnx(onnx, engine, workspace_gb: float = 6.0) -> str:
 def build(engine, workspace_gb: float = 6.0) -> None:
     """Stage 2: strongly typed engine from the ONNX graph of stage 1."""
     spec = EngineSpec.load(engine)
-    spec.tensorrt, spec.platform = build_onnx(onnx_path(engine), engine, workspace_gb), sys.platform
+    profiles = [{"x": (spec.batch, 64, s // 32, s // 32)} for s in spec.profiles] if spec.profiles else None
+    spec.tensorrt, spec.platform = build_onnx(onnx_path(engine), engine, workspace_gb, profiles), sys.platform
     spec.save(engine)
 
 
 class TRTTransformer:
-    """Runs the engine on the current CUDA stream. The output buffer is reused: consume it before the next call."""
+    """Runs the engine on the current CUDA stream. The output buffer is reused: consume it before the next call.
 
-    def __init__(self, engine, device: str = "cuda"):
+    `size`: another size of a dynamic-size engine (`EngineSpec.profiles`); `share`: a TRTTransformer of the same engine
+    file whose deserialized engine (and so weights) this one uses, with an execution context of its own. `spec.size`
+    and `noise` are then this size's (the init noise centre-cropped)."""
+
+    def __init__(self, engine, device: str = "cuda", size: Optional[int] = None, share: "TRTTransformer" = None):
         import tensorrt as trt
-        self.spec = EngineSpec.load(engine)
-        if self.spec.tensorrt != trt.__version__ or self.spec.platform != sys.platform:
-            raise RuntimeError(f"{engine} was built with TensorRT {self.spec.tensorrt} on {self.spec.platform}; "
+        spec = EngineSpec.load(engine)
+        if spec.tensorrt != trt.__version__ or spec.platform != sys.platform:
+            raise RuntimeError(f"{engine} was built with TensorRT {spec.tensorrt} on {spec.platform}; "
                                f"this is TensorRT {trt.__version__} on {sys.platform}")
+        size = size or spec.size
+        if size != spec.size and size not in (spec.profiles or []):
+            raise ValueError(f"{engine} runs at {spec.profiles or [spec.size]}, not {size}")
+        self.profile = spec.profiles.index(size) if spec.profiles else None
         from safetensors.torch import load_file
         self.device = torch.device(device)
-        self.noise = load_file(str(noise_path(engine)))[lora_mod.NOISE_KEY].to(self.device, torch.float32)
+        noise = load_file(str(noise_path(engine)))[lora_mod.NOISE_KEY]
+        g = size // 32
+        y, x = (noise.shape[-2] - g) // 2, (noise.shape[-1] - g) // 2
+        self.noise = noise[..., y:y + g, x:x + g].contiguous().to(self.device, torch.float32)
+        self.spec = dataclasses.replace(spec, size=size)
         self._log = trt.Logger(trt.Logger.WARNING)
-        self.engine = trt.Runtime(self._log).deserialize_cuda_engine(Path(engine).read_bytes())
-        self.ctx = self.engine.create_execution_context()
-        lat = self.spec.size // 32
-        self.out = torch.empty((self.spec.batch, 32, lat, lat), dtype=torch.float16, device=self.device)
+        self.engine = (share.engine if share is not None
+                       else trt.Runtime(self._log).deserialize_cuda_engine(Path(engine).read_bytes()))
+        self.configure(self.engine.create_execution_context())
+        self.out = torch.empty((spec.batch, 32, g, g), dtype=torch.float16, device=self.device)
+
+    def configure(self, ctx) -> None:
+        """Take `ctx` as the execution context, set to this size's profile (also after `share_scratch`)."""
+        self.ctx = ctx
+        if self.profile is not None:
+            stream = torch.cuda.current_stream(self.device)
+            ctx.set_optimization_profile_async(self.profile, stream.cuda_stream)
+            stream.synchronize()
+            g = self.spec.size // 32
+            ctx.set_input_shape("x", (self.spec.batch, 64, g, g))
 
     def __call__(self, x: torch.Tensor, enc: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         """x (B, 64, h, w) fp16 noisy ++ reference latent, enc (B, L, 2240) fp16 projected context, t (B,) fp32
@@ -270,6 +312,30 @@ class TRTTransformer:
             errs.append(rel_err(v, ck[f"v{i}"]))
         torch.cuda.synchronize()
         return errs
+
+
+def share_scratch(*runners, device: str = "cuda") -> torch.Tensor:
+    """One scratch buffer, as large as the largest needed, for TensorRT execution contexts that run one after another
+    on one CUDA stream (the transformer engine, taesana's encoder and decoder, the face pass's engines; anything with
+    `.engine` and `.ctx`): each context is recreated with user-managed device memory pointing at it. Contexts that
+    run on another stream at the same time (`face.TRTYuNet`) must not share it. Returns the buffer; keep it alive.
+
+    Each context otherwise holds its own scratch (taesana's decoder at batch 8 alone 1.2 GB at 640), which on an 8 GB
+    GPU decides between fitting and not (README, "8 GB GPUs")."""
+    import tensorrt as trt
+    for r in runners:
+        r.ctx = None
+    torch.cuda.empty_cache()
+    n = max(r.engine.device_memory_size_v2 for r in runners)
+    buf = torch.empty(n, dtype=torch.uint8, device=device)
+    for r in runners:
+        ctx = r.engine.create_execution_context(trt.ExecutionContextAllocationStrategy.USER_MANAGED)
+        ctx.set_device_memory(buf.data_ptr(), n)
+        if hasattr(r, "configure"):
+            r.configure(ctx)
+        else:
+            r.ctx = ctx
+    return buf
 
 
 def median_ms(fn, n: int = 20, warm: int = 5) -> float:

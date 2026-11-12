@@ -24,7 +24,7 @@ import _paths  # noqa: F401
 from vibe_stream import lora, trt_engine
 from vibe_stream.metrics import read_video_frames
 from vibe_stream.presets import EVAL_CLIPS_DIR, PROMPTS, TRAIN_CLIPS_DIR
-from vibe_stream.vibe_model import REFERENCE_INSTRUCTION, ROOT, VibeModel
+from vibe_stream.vibe_model import REFERENCE_INSTRUCTION, ROOT, VibeModel, student_model_args
 
 REFERENCE_PROMPT = "reference image to the encoder"   # how make_teacher_data.py describes a reference style
 
@@ -33,8 +33,13 @@ def export(a):
     if a.int8:
         from vibe_stream import trt_int8  # noqa: F401  (before the weights are loaded, see trt_int8)
     meta = lora.load(a.student)[1]
-    size = int(meta.get("size", 768))
-    m = VibeModel(size=size)
+    args = student_model_args(meta)
+    if a.remove_blocks is not None:
+        args["remove_blocks"] = a.remove_blocks
+    size = args["size"]
+    # --low_vram: the transformer blocks and DC-AE wait on the CPU while the calibration prompts are embedded, and
+    # come to the GPU once the text encoder has left it (export peak 5.8 GB at 640, 6.6 at 768)
+    m = VibeModel(**args, denoiser_on_gpu=not a.low_vram)
     # real inputs for the check file: the first frames of a clip and the student's first prompt
     frames = read_video_frames(ROOT / EVAL_CLIPS_DIR / "blackswan.mp4", size, a.batch)
     prompts = list(meta.get("prompts", PROMPTS).values())
@@ -69,8 +74,12 @@ def export(a):
                 calls = trt_int8.calibration_calls(graph, batches, m.noise, timesteps, sigmas, 1000.0 * s * m.tscale, s)
             return trt_int8.quantize(graph, calls)
     m.offload_text_encoder()
-    img_lat = m.encode(frames)
-    trt_engine.export(m, a.student, a.engine, a.batch, img_lat, emb, quantize=quantize)
+    if a.low_vram:
+        m.pipe.transformer.to(m.device)
+        m.pipe.vae.to(m.device)
+    img_lat = m.encode(frames, chunk=1 if a.low_vram else 10)   # DC-AE on 8 frames next to the transformer: > 8 GB
+    trt_engine.export(m, a.student, a.engine, a.batch, img_lat, emb, quantize=quantize,
+                      extra_sizes=a.extra_sizes)
 
 
 def bench(a):
@@ -99,6 +108,12 @@ def main():
     p.add_argument("--calib_clips", type=int, default=10, help="with --int8: training clips to calibrate on")
     p.add_argument("--calib_refs", default="data/style_ft_768/student_refs.txt",
                    help="with --int8, for a student with reference styles: reference images, one path per line")
+    p.add_argument("--remove_blocks", type=lambda s: [int(x) for x in s.split(",")], default=None,
+                   help="transformer blocks the student was trained without, e.g. 14,18 (default: as its metadata says)")
+    p.add_argument("--low_vram", action="store_true", help="export in an order that fits an 8 GB GPU (export stage)")
+    p.add_argument("--extra_sizes", type=int, nargs="*", default=[],
+                   help="further sizes the engine runs at, one optimization profile each on the same weights (e.g. 256 "
+                        "for the face pass: --face_engine main)")
     a = p.parse_args()
     if a.stage == "all":
         rest = [x for x in sys.argv[1:] if x != "all"]

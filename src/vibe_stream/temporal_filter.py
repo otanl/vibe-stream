@@ -15,6 +15,12 @@ softening and double images of a full-band blend (see README, "Temporal filter")
 
 The flows of a batch are computed when the batch is staged, on the host thread, while the GPU still works on the
 previous batch; the blending runs on the GPU after the decoder.
+
+`fast=True` computes the smooth quantities at half resolution: the low band (a blur of sigma / 2 there, upsampled),
+the occlusion weight, and the low band's recursion; only the high band is blended at full resolution. At 640 on the
+carry-over path the output stays 38-40 dB from the full-resolution filter's with the same flicker, and the filter and
+the carry-over's GPU side (`Carry(fast=True)`) together take 0.9 instead of 1.3 ms per frame on an RTX 3090 Ti, which
+matters on smaller GPUs (README, "Removing transformer blocks").
 """
 
 from __future__ import annotations
@@ -31,9 +37,12 @@ from .temporal_loss import flow_grid, warp_grid
 
 class TemporalFilter:
     def __init__(self, low: float = 0.7, high: float = 0.3, sigma: float = 6.0, tau: float = 12.0,
-                 flow_size: int = 320, device: str = "cuda"):
+                 flow_size: int = 320, device: str = "cuda", fast: bool = False):
         self.low, self.high, self.tau, self.flow_size, self.device = low, high, tau, flow_size, device
+        self.fast = fast
         self.dis = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_FAST)
+        if fast:
+            sigma = sigma / 2                                   # the low band's blur, at half resolution
         r = int(3 * sigma + 0.5)
         k = torch.exp(-torch.arange(-r, r + 1, dtype=torch.float32) ** 2 / (2 * sigma ** 2))
         self.kernel = (k / k.sum()).to(device)
@@ -87,6 +96,8 @@ class TemporalFilter:
     @torch.inference_mode()
     def __call__(self, inputs: torch.Tensor, outputs: torch.Tensor, flows: Tuple[torch.Tensor, List[bool]]) -> torch.Tensor:
         """inputs / outputs (B, H, W, 3) uint8 on the GPU and the batch's `flows` -> filtered outputs, same layout."""
+        if self.fast:
+            return self._fast(inputs, outputs, flows)
         h, w = outputs.shape[1:3]
         x_in = inputs.permute(0, 3, 1, 2).float()
         out = outputs.permute(0, 3, 1, 2).float()
@@ -112,3 +123,38 @@ class TemporalFilter:
             shown.append(lo + hi)
         self._prev_in, self._prev_low, self._prev_high = x_in[-1:], prev[:, :3], prev[:, 3:]
         return torch.cat(shown).clamp(0, 255).round().to(torch.uint8).permute(0, 2, 3, 1).contiguous()
+
+    def _fast(self, inputs, outputs, flows):
+        """`__call__` with the low band, the occlusion weight and the low band's recursion at half resolution."""
+        h, w = outputs.shape[1:3]
+        size_h = (h // 2, w // 2)
+        x_in = inputs.permute(0, 3, 1, 2).float()
+        out = outputs.permute(0, 3, 1, 2).float()
+        low = self._blur(F.avg_pool2d(out, 2))                                  # (B, 3, h / 2, w / 2)
+        high = out - _up(low, (h, w))
+        fl_all, has = flows
+        fl = fl_all.permute(0, 3, 1, 2)
+        grid_h = flow_grid((F.interpolate(fl, size=size_h, mode="bilinear", align_corners=False)
+                            * (size_h[0] / self.flow_size)).permute(0, 2, 3, 1))
+        grid = flow_grid((F.interpolate(fl, size=(h, w), mode="bilinear", align_corners=False)
+                          * (h / self.flow_size)).permute(0, 2, 3, 1))
+        x_in_h = F.avg_pool2d(x_in, 2)
+        prev_in = torch.cat([x_in_h[:1] if self._prev_in is None else self._prev_in, x_in_h[:-1]])
+        m_h = torch.exp(-(x_in_h - warp_grid(prev_in, grid_h)).abs().mean(1, keepdim=True) / self.tau)
+        m = _up(m_h, (h, w))
+        prev_lo, prev_hi = self._prev_low, self._prev_high
+        shown = []
+        for j in range(len(out)):
+            lo, hi = low[j:j + 1], high[j:j + 1]
+            if has[j] and prev_lo is not None:
+                mh, mj = m_h[j:j + 1], m[j:j + 1]
+                lo = mh * self.low * warp_grid(prev_lo, grid_h[j:j + 1]) + (1 - mh * self.low) * lo
+                hi = mj * self.high * warp_grid(prev_hi, grid[j:j + 1]) + (1 - mj * self.high) * hi
+            prev_lo, prev_hi = lo, hi
+            shown.append(_up(lo, (h, w)) + hi)
+        self._prev_in, self._prev_low, self._prev_high = x_in_h[-1:], prev_lo, prev_hi
+        return torch.cat(shown).clamp(0, 255).round().to(torch.uint8).permute(0, 2, 3, 1).contiguous()
+
+
+def _up(x: torch.Tensor, size) -> torch.Tensor:
+    return F.interpolate(x, size=size, mode="bilinear", align_corners=False)

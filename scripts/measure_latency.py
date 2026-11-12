@@ -4,7 +4,8 @@ time, and each frame's delay is the time from its hand-over to its edited copy b
 Per run: mean, 95th percentile and worst delay over the frames after the first two batches, and the median time
 from a batch's last frame to its result. A batch that takes longer than batch / fps makes the delay grow; the run then
 says it falls behind. --check compares the outputs with those of StreamEditor.run on the same frames (bit for bit
-with the batch-8 engines; the smaller batches' INT8 engines vary slightly from run to run, see vibe_stream.live).
+with the fp16 engines and the 768 batch-8 INT8 ones; the other INT8 engines vary slightly from run to run, see
+vibe_stream.live).
 
 Usage:
   python scripts/measure_latency.py --engine out/trt/vibe_lam4_carry_s05_lut_2step_768_b4_int8.engine \
@@ -69,6 +70,12 @@ def main():
     p.add_argument("--prompt", default="oil")
     p.add_argument("--carry", action="store_true")
     p.add_argument("--temporal_filter", type=float, nargs=2, default=None, metavar=("LOW", "HIGH"))
+    p.add_argument("--fast_post", action="store_true", help="filter and carry-over at reduced resolution")
+    p.add_argument("--reembed_async", action="store_true", help="with --carry: embed at cuts on the side, no stall")
+    p.add_argument("--face_engine", default=None, help="face pass (vibe_stream.face): engine at the crop size, or \"main\" (build_trt.py --extra_sizes)")
+    p.add_argument("--face_tae_engine", default=None, help="with --face_engine: taesana engines at the crop size")
+    p.add_argument("--face_model", default=str(ROOT / "models/face_detection_yunet_2023mar.onnx"),
+                   help="with --face_engine: YuNet face detector (OpenCV model zoo)")
     p.add_argument("--check", action="store_true", help="compare the outputs with StreamEditor.run's")
     p.add_argument("--out_json", default=None)
     a = p.parse_args()
@@ -76,13 +83,29 @@ def main():
     size, B = eng.spec.size, eng.spec.batch
     frames = list(islice(cycle(read_video_frames(a.input, size)), a.frames // B * B))
     vibe = VibeModel(size=size)
+    face = None
+    if a.face_engine:
+        from vibe_stream.face import FacePass
+        from vibe_stream.taesana import TinyAutoencoder
+        other = [s for s in (eng.spec.profiles or []) if s != eng.spec.size]
+        face_engine = (TRTTransformer(a.engine, size=other[0], share=eng) if a.face_engine == "main" and other
+                       else TRTTransformer(a.face_engine))
+        face = FacePass(vibe, face_engine,
+                        TRTTinyAutoencoder(a.face_tae_engine) if a.face_tae_engine else TinyAutoencoder(), a.face_model)
     ed = StreamEditor(vibe, TRTTinyAutoencoder(a.tae_engine), engine=eng,
-                      temporal_filter=TemporalFilter(*a.temporal_filter) if a.temporal_filter else None,
-                      carry=Carry(0) if a.carry else None)
+                      temporal_filter=TemporalFilter(*a.temporal_filter, fast=a.fast_post) if a.temporal_filter else None,
+                      carry=Carry(0, fast=a.fast_post) if a.carry else None, reembed_async=a.reembed_async,
+                      face=face)
     ed.set_prompt(PROMPTS.get(a.prompt, a.prompt), frames[0])
     offline, tm = ed.run(frames, 2)   # warm-up; the same batch size's offline loop rate for reference
     path = "carry-over + filter" if a.carry and a.temporal_filter else "carry-over" if a.carry else \
         "filter" if a.temporal_filter else "2 steps"
+    if a.fast_post:
+        path += " (fast post)"
+    if a.reembed_async:
+        path += " (async re-embedding)"
+    if face is not None:
+        path += " + face pass"
     res = dict(engine=a.engine, size=size, batch=B, path=path, offline_loop_fps=tm.loop_fps, runs={})
     for fps in a.fps:
         delay, after, outs = measure(ed, frames, fps)

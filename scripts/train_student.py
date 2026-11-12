@@ -129,7 +129,9 @@ def main():
     p.add_argument("--state_carry", type=float, default=0.0,
                    help="initial alpha of the carried self-attention state (vibe_stream.state_attn; 0: off)")
     p.add_argument("--state_lr", type=float, default=1e-2, help="learning rate of the state carry's alpha logits")
-    p.add_argument("--init", default=None, help="start the student from this LoRA file (same rank and noise)")
+    p.add_argument("--init", default=None, help="start the student from this LoRA file (same rank; its noise is kept)")
+    p.add_argument("--remove_blocks", type=lambda s: [int(x) for x in s.split(",")], default=None,
+                   help="train without these transformer blocks, e.g. 14,18 (README, \"Removing transformer blocks\")")
     p.add_argument("--ref_min_edge", type=float, default=None,
                    help="leave out reference-style windows whose teacher output has less edge agreement with the input")
     p.add_argument("--seed", type=int, default=0)
@@ -157,26 +159,34 @@ def main():
     keys = list(prompts)
     print(f"[train] {len(data)} windows x {len(keys)} prompts at {size}, {a.student_steps}-step student, lam {a.lam}", flush=True)
     combos = None
+    if any(f"tlat_{k}" not in d for d in data for k in keys):
+        # windows holding a subset of the prompts (external teachers): sample only the pairs present
+        combos = [(d, k) for d in data for k in keys if f"tlat_{k}" in d]
+        print(f"[train] {len(combos)} (window, prompt) pairs present", flush=True)
     if a.ref_min_edge is not None:
-        combos = [(d, k) for d in data for k in keys if f"ref_{k}" not in d
+        combos = [(d, k) for d, k in (combos or [(d, k) for d in data for k in keys]) if f"ref_{k}" not in d
                   or edge_agreement(d["frames"][0], d[f"timg_{k}"][0]) >= a.ref_min_edge]
         print(f"[train] {len(combos)} of {len(data) * len(keys)} (window, prompt) pairs kept "
               f"(reference styles with edge agreement >= {a.ref_min_edge})", flush=True)
 
-    m = VibeModel(size=size, keep_text_encoder=False)
+    # a student started from another keeps its init noise (one resized from another size, resize_student.py, has a
+    # crop of that size's draw instead of the seed's draw at this size; teacher data for it is made with the same
+    # noise, make_teacher_data.py --noise_from)
+    init_state = lora.load(a.init)[0] if a.init else {}
+    m = VibeModel(size=size, keep_text_encoder=False, noise=init_state.get(lora.NOISE_KEY),
+                  remove_blocks=a.remove_blocks or ())
     m.vae.requires_grad_(False)
     dev = m.device
     wrappers = lora.attach(m.tr, a.rank)
+    if a.remove_blocks:
+        print(f"[train] transformer blocks {m.removed_blocks} removed", flush=True)
     if a.init:
-        state, _ = lora.load(a.init)
-        if lora.NOISE_KEY in state and not torch.equal(state[lora.NOISE_KEY].to(dev), m.noise):
-            raise SystemExit(f"{a.init} was trained on a different init noise")
-        lora.load_into(wrappers, state)
+        lora.load_into(wrappers, init_state)
     params = [q for w in wrappers.values() for q in (w.A, w.B)]
     print(f"[train] {len(wrappers)} LoRA layers, {sum(q.numel() for q in params) / 1e6:.1f} M params", flush=True)
     sc = None
     if a.state_carry > 0:
-        init_alpha = state.get(state_attn.ALPHA_KEY, a.state_carry) if a.init else a.state_carry
+        init_alpha = init_state.get(state_attn.ALPHA_KEY, a.state_carry) if a.init else a.state_carry
         sc = state_attn.StateCarry(m.tr, init_alpha, learn=True)
         # 2-step part: pairs (t, t + 1); carried part: runs of carry_seq frames; anything else (the no-grad hop) alone
         sc.groups = {2 * a.pairs: 2, a.pairs * a.carry_seq: a.carry_seq}
@@ -443,7 +453,8 @@ def main():
                                                      carry_sigma=a.carry_sigma if a.w_carry > 0 else None,
                                                      carry_fill=a.carry_fill if a.w_carry > 0 else None,
                                                      carry_lam=a.carry_lam, init=a.init, ref_min_edge=a.ref_min_edge,
-                                                     carry_seq=a.carry_seq, state_carry=a.state_carry))
+                                                     carry_seq=a.carry_seq, state_carry=a.state_carry,
+                                                     removed_blocks=m.removed_blocks))
     print(f"[train] saved {run / 'lora.safetensors'} after {time.perf_counter() - t0:.0f} s", flush=True)
 
 
