@@ -22,6 +22,10 @@ the pruned Klein 640 student the engine stays 1.58 GB (two engines: 3.43 GB), it
 
 Measured on an RTX 3090 Ti with TensorRT 10.16 at 768, batch 8: 2.98 GB engine built in 100 s, velocity within
 1.3-2.0 % of bf16 PyTorch, 18.8 ms per frame per step (21.3 with K / V per frame; bf16 PyTorch eager: 36 ms).
+
+The runners replay each engine call as a CUDA graph (`capture`), captured on the first call: enqueueing the pruned
+640 INT8 engine takes the host 14 ms at batch 2 (0.7 ms as a graph), and at 256, where the kernels are short, the
+launches set the pace (batch 2: 11.1 ms on the GPU, 7.2 as a graph). The inputs are copied into fixed buffers first.
 """
 
 from __future__ import annotations
@@ -257,9 +261,11 @@ class TRTTransformer:
 
     `size`: another size of a dynamic-size engine (`EngineSpec.profiles`); `share`: a TRTTransformer of the same engine
     file whose deserialized engine (and so weights) this one uses, with an execution context of its own. `spec.size`
-    and `noise` are then this size's (the init noise centre-cropped)."""
+    and `noise` are then this size's (the init noise centre-cropped). `cuda_graph`: replay the call as a CUDA graph
+    (module docstring); call it from one thread."""
 
-    def __init__(self, engine, device: str = "cuda", size: Optional[int] = None, share: "TRTTransformer" = None):
+    def __init__(self, engine, device: str = "cuda", size: Optional[int] = None, share: "TRTTransformer" = None,
+                 cuda_graph: bool = True):
         import tensorrt as trt
         spec = EngineSpec.load(engine)
         if spec.tensorrt != trt.__version__ or spec.platform != sys.platform:
@@ -279,12 +285,14 @@ class TRTTransformer:
         self._log = trt.Logger(trt.Logger.WARNING)
         self.engine = (share.engine if share is not None
                        else trt.Runtime(self._log).deserialize_cuda_engine(Path(engine).read_bytes()))
+        self.cuda_graph = cuda_graph
         self.configure(self.engine.create_execution_context())
         self.out = torch.empty((spec.batch, 32, g, g), dtype=torch.float16, device=self.device)
 
     def configure(self, ctx) -> None:
         """Take `ctx` as the execution context, set to this size's profile (also after `share_scratch`)."""
         self.ctx = ctx
+        self._graph = self._in = None       # a graph holds the old context's memory
         if self.profile is not None:
             stream = torch.cuda.current_stream(self.device)
             ctx.set_optimization_profile_async(self.profile, stream.cuda_stream)
@@ -295,11 +303,24 @@ class TRTTransformer:
     def __call__(self, x: torch.Tensor, enc: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         """x (B, 64, h, w) fp16 noisy ++ reference latent, enc (B, L, 2240) fp16 projected context, t (B,) fp32
         scaled timestep -> velocity (B, 32, h, w) fp16."""
-        bufs = {"x": x.contiguous(), "enc": enc.contiguous(), "t": t.contiguous(), "v": self.out}
-        for name, ten in bufs.items():
-            self.ctx.set_tensor_address(name, ten.data_ptr())
-        if not self.ctx.execute_async_v3(torch.cuda.current_stream(self.device).cuda_stream):
-            raise RuntimeError("TensorRT execution failed")
+        if not self.cuda_graph:
+            bufs = {"x": x.contiguous(), "enc": enc.contiguous(), "t": t.contiguous(), "v": self.out}
+            for name, ten in bufs.items():
+                self.ctx.set_tensor_address(name, ten.data_ptr())
+            enqueue(self.ctx, self.device)
+            return self.out
+        ins = {"x": x, "enc": enc, "t": t}
+        if self._graph is None or any(self._in[k].shape != v.shape for k, v in ins.items()):
+            self._in = {k: torch.empty(v.shape, dtype=v.dtype, device=self.device) for k, v in ins.items()}
+            for name, ten in {**self._in, "v": self.out}.items():
+                self.ctx.set_tensor_address(name, ten.data_ptr())
+            self._graph = None
+        for k, v in ins.items():
+            self._in[k].copy_(v)
+        if self._graph is None:
+            self._graph = capture(self.ctx, self.device)
+        else:
+            self._graph.replay()
         return self.out
 
     def check(self, engine) -> List[float]:
@@ -312,6 +333,23 @@ class TRTTransformer:
             errs.append(rel_err(v, ck[f"v{i}"]))
         torch.cuda.synchronize()
         return errs
+
+
+def enqueue(ctx, device) -> None:
+    """Run a TensorRT execution context (its tensor addresses set) on the current stream."""
+    if not ctx.execute_async_v3(torch.cuda.current_stream(device).cuda_stream):
+        raise RuntimeError("TensorRT execution failed")
+
+
+def capture(ctx, device) -> "torch.cuda.CUDAGraph":
+    """Run `ctx` once on the current stream, then capture the same call as a CUDA graph and return it: replaying it
+    reads and writes the tensor addresses set now. The first run does TensorRT's deferred setup, which must not land
+    in the graph. Other threads may use the GPU meanwhile (thread-local capture)."""
+    enqueue(ctx, device)
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g, capture_error_mode="thread_local"):
+        enqueue(ctx, device)
+    return g
 
 
 def share_scratch(*runners, device: str = "cuda") -> torch.Tensor:
@@ -331,10 +369,7 @@ def share_scratch(*runners, device: str = "cuda") -> torch.Tensor:
     for r in runners:
         ctx = r.engine.create_execution_context(trt.ExecutionContextAllocationStrategy.USER_MANAGED)
         ctx.set_device_memory(buf.data_ptr(), n)
-        if hasattr(r, "configure"):
-            r.configure(ctx)
-        else:
-            r.ctx = ctx
+        r.configure(ctx)
     return buf
 
 

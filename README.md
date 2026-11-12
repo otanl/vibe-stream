@@ -242,6 +242,48 @@ differ by LPIPS 0.01); the INT8 engines for 768 batch 8 and the fp16 engines are
 source of run-to-run variation, now removed: the colour map of the LUT fill was summed with atomic adds (`Carry`'s
 `fit_colour_map`).
 
+**Shorter paths inside a batch.** Measured on the live path at 640 at batch 2, with the commercial student
+(`klein640_prune14_18` INT8 with the 256 profile for faces, `--fast_post`, carry-over + filter 0.7 / 0.3, `breakdance`
+at 30 fps): 51 ms pass between a batch's last frame and its result. Of these, 11 ms are that frame's host flows,
+the filter's (4.6 ms) and then the carry-over's (5.9 ms). The other 39 ms are on the GPU: the transformer 24.5, the
+decoder 5.4, the three encoder calls 2.5, the carry-over's start 2.7 and the filter 1.2. Two changes shorten this:
+
+- `LiveEditor` now computes the filter's flow on a worker beside the carry-over's, which cuts the 11 ms to 6.
+- The TensorRT runners replay their calls as CUDA graphs (`trt_engine.capture`).
+  - Enqueueing the INT8 transformer takes the host 14 ms per call at batch 2, which as a graph drops to 0.7 ms.
+  - The 256 call of the face pass goes from 11.1 to 7.2 ms on the GPU: its kernels are short, so the launches set
+    the pace.
+  - Output is identical bit for bit (768 batch 8 INT8 engine).
+
+Same runs, before / after:
+
+| Batch | Delay | Last frame to result | Offline loop | With face pass: delay | Last frame to result | Offline loop |
+|---|---:|---:|---:|---:|---:|---:|
+| 8 | 237 / 354 → 229 / 346 ms | 121 → 113 ms | 77.1 → 78.7 fps | 272 / 390 → 262 / 379 ms | 155 → 145 ms | 57.4 → 62.9 fps |
+| 4 | 125 / 175 → 116 / 167 ms | 74 → 66 ms | 64.3 → 71.0 fps | 153 / 207 → 139 / 191 ms | 103 → 90 ms | 43.7 → 54.5 fps |
+| 2 | 68 / 86 → 60 / 78 ms | 51 → 43 ms | 54.7 → 59.1 fps | falls behind → 78 / 96 ms | 216 → 61 ms | 30.4 → 41.8 fps |
+
+Batch 2 with the face pass used to fall behind a 30 fps source: the host spent 66 ms queueing each batch against the
+67 ms the source leaves. What remains is GPU time, mostly the transformer: per frame it costs 11.6 ms at batch 2 and
+8.6 ms at batch 8, since the matrix products at batch 2 are too small to fill the GPU.
+
+With this student, smaller batches flicker more and come out sharper (with `lam4` above, warping error and Sobel went
+down instead). Each batch starts
+from the last output of the one before, and its single step redraws the high band, so with smaller batches that
+redraw comes two or four times as often. A slightly stronger filter at batch 2 makes up for it. On the 4 evaluation
+clips (ping-pong, 96 frames) x oil / anime / ukiyo-e / night / gouache / autumn:
+
+| Batch, filter | CLIP direction | Flicker (low / high) | Warping error | Sobel |
+|---|---:|---:|---:|---:|
+| 8, 0.7 / 0.3 | 0.156 | 7.38 (2.57 / 6.64) | 10.65 | 9.96 |
+| 4, 0.7 / 0.3 | 0.156 | 8.13 (2.78 / 7.31) | 11.27 | 10.86 |
+| 2, 0.7 / 0.3 | 0.156 | 8.04 (2.77 / 7.22) | 11.17 | 10.76 |
+| 2, 0.7 / 0.4 | 0.156 | 7.41 (2.70 / 6.59) | 10.58 | 10.10 |
+| 2, 0.75 / 0.45 | 0.156 | 7.07 (2.59 / 6.29) | 10.26 | 9.78 |
+
+Batch 2 with 0.7 / 0.4 is batch 8's picture at a quarter of the delay. On an RTX 3090 Ti it keeps up with 30 fps
+with the face pass too; weaker GPUs have not been tried yet.
+
 **Re-embedding at cuts without a stall.** At a cut the instruction is embedded again with the frame after it ("Flicker",
 carry-over), and live the stream waits for it: at 640 on the 3090 Ti (fp16 engine) the cut batch comes out about
 400 ms later than the others (560 against 153 ms from its last frame) and the next one 280 ms. With `StreamEditor(reembed_async=True)`
@@ -705,7 +747,8 @@ input's flow, where that flow holds) drops from 9.8 to 5.6 (the input's own: 3.2
 blotched. The eyes and brows still move a little. On an RTX 3090 Ti (`breakdance`) it costs 4.7 ms per frame on the
 GPU (loop 75 to 58 fps), one more text-encoder run per clip (about 160 ms) and a second copy of the transformer's
 weights (1.9 GB in INT8); live at a 30 fps source the delay goes from 243 / 360 to 284 / 400 ms (mean / 95th
-percentile). YuNet runs as a TensorRT engine (`build_trt_yunet.py`, 4.4 ms per frame at 640 on an idle GPU, the same
+percentile; batch 2 with the engines replayed as CUDA graphs: 60 / 78 to 78 / 96 ms, Speed, "Shorter paths inside a
+batch"). YuNet runs as a TensorRT engine (`build_trt_yunet.py`, 4.4 ms per frame at 640 on an idle GPU, the same
 faces as OpenCV's) or through OpenCV on the host (11 ms at 384); either way detection, crops and their flows run on a
 thread beside the stream. Which is faster depends on the GPU's headroom: on the 3090 Ti the engine (loop 57.0 against
 50.6 fps with OpenCV), on an RTX 4060 Ti, whose GPU is the bottleneck, OpenCV (29.9 against 25.9 fps: the engine's

@@ -22,6 +22,7 @@ import torch
 import torch.nn as nn
 
 from .taesana import TinyAutoencoder
+from .trt_engine import capture, enqueue
 
 
 @dataclasses.dataclass
@@ -103,16 +104,34 @@ def build(prefix, workspace_gb: float = 4.0) -> None:
 
 
 class _Runner:
-    def __init__(self, runtime, path: Path):
+    """One engine; with `cuda_graph` its call is replayed as a CUDA graph on fixed buffers (`trt_engine.capture`)."""
+
+    def __init__(self, runtime, path: Path, cuda_graph: bool = True):
         self.engine = runtime.deserialize_cuda_engine(path.read_bytes())
-        self.ctx = self.engine.create_execution_context()
+        self.cuda_graph = cuda_graph
+        self.configure(self.engine.create_execution_context())
+
+    def configure(self, ctx) -> None:
+        """Take `ctx` as the execution context (also after `trt_engine.share_scratch`)."""
+        self.ctx = ctx
+        self._graph = self._x = self._out = None
 
     def __call__(self, x: torch.Tensor, out: torch.Tensor, names, device) -> torch.Tensor:
-        self.ctx.set_tensor_address(names[0], x.data_ptr())
-        self.ctx.set_tensor_address(names[1], out.data_ptr())
-        if not self.ctx.execute_async_v3(torch.cuda.current_stream(device).cuda_stream):
-            raise RuntimeError("TensorRT execution failed")
-        return out
+        if not self.cuda_graph:
+            self.ctx.set_tensor_address(names[0], x.data_ptr())
+            self.ctx.set_tensor_address(names[1], out.data_ptr())
+            enqueue(self.ctx, device)
+            return out
+        if self._graph is None or self._x.shape != x.shape or self._out.shape != out.shape:
+            self._x, self._out = torch.empty_like(x), torch.empty_like(out)
+            self.ctx.set_tensor_address(names[0], self._x.data_ptr())
+            self.ctx.set_tensor_address(names[1], self._out.data_ptr())
+            self._x.copy_(x)
+            self._graph = capture(self.ctx, device)
+        else:
+            self._x.copy_(x)
+            self._graph.replay()
+        return out.copy_(self._out)
 
 
 class TRTTinyAutoencoder:

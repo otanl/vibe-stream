@@ -7,13 +7,13 @@ batch cannot be staged before its last frame has arrived, so that host work woul
 GPU: 117 ms per batch of 8 at 768, which with the GPU's 169 ms exceeds the 267 ms a 30 fps source leaves, and the
 delay grows without bound. `LiveEditor` computes each frame's flows on a thread as the frame arrives
 (`TemporalFilter.host_flow`, `Carry.host_flow`; the carry-over's reference, the previous batch's last frame, is known
-by then), so only the last frame's flows lie between it and the GPU. It runs the same operations as
-`StreamEditor.run` on the same frames; with the fp16 engines and the INT8 ones for 768 batch 8 the output is identical
-bit for bit, also across a cut where the instruction is embedded again. The other INT8 engines (768 batch 4 and 2, 640
-batch 8) are not bit-reproducible even from one offline run to the next: TensorRT's kernels for their smaller matrix
-products sum in a varying order, so a transformer call can differ by up to about 0.1 in velocity, and the difference
-fades over the following batches. At 640 batch 8 that happens on every call (LPIPS between two offline runs of a clip
-about 0.01).
+by then), so only the last frame's flows lie between it and the GPU, the two computed side by side. It runs the same
+operations as `StreamEditor.run` on the same frames; with the fp16 engines and the INT8 ones for 768 batch 8 the
+output is identical bit for bit, also across a cut where the instruction is embedded again. The other INT8 engines (768
+batch 4 and 2, 640 batch 8) are not bit-reproducible even from one offline run to the next: TensorRT's kernels for
+their smaller matrix products sum in a varying order, so a transformer call can differ by up to about 0.1 in velocity,
+and the difference fades over the following batches. At 640 batch 8 that happens on every call (LPIPS between two
+offline runs of a clip about 0.01).
 
 With a face pass (`vibe_stream.face`), its host work (face detection, the face crops and their flows, about 15 ms per
 frame) runs on a second thread beside the first.
@@ -34,13 +34,16 @@ waits.
 
 Delay at a 30 fps source, the INT8 engines with carry-over + filter (scripts/measure_latency.py), mean / 95th
 percentile: at 768 batch 8 298 / 415 ms, batch 4 150 / 201 ms, batch 2 80 / 98 ms (batch 1, 26 fps, falls behind);
-at 640 250 / 368, 128 / 178 and 68 / 87 ms.
+at 640 250 / 368, 128 / 178 and 68 / 87 ms. With the commercial student at 640 (pruned, INT8, `--fast_post`) and the
+engines replayed as CUDA graphs: 229 / 346, 116 / 167 and 60 / 78 ms; with the face pass 262 / 379, 139 / 191 and
+78 / 96 ms (README, "Shorter paths inside a batch": at batch 2 a filter of 0.7 / 0.4 matches batch 8's flicker).
 """
 
 from __future__ import annotations
 
 import queue
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional
 
 import numpy as np
@@ -86,6 +89,9 @@ class LiveEditor:
 
     def _host(self) -> None:
         tf, cr, fp, B = self.ed.tfilter, self.ed.carry, self.ed.face, self.batch_size
+        # the filter's flow on a worker beside the carry-over's (OpenCV releases the GIL): the last frame of a batch
+        # then holds the GPU back by the longer of the two (about 6 ms at 640), not by both (about 11 ms)
+        pool = ThreadPoolExecutor(1) if tf is not None and cr is not None else None
         ref = None
         while True:
             frames, tfl, grays, res, early = [], [], [], [], None
@@ -95,9 +101,12 @@ class LiveEditor:
                     self._face_in.put(f)
                 if f is None:
                     self._ready.put(None)
+                    if pool is not None:
+                        pool.shutdown()
                     return
                 frames.append(f)
-                if tf is not None:
+                job = pool.submit(tf.host_flow, f) if pool is not None else None
+                if tf is not None and job is None:
                     tfl.append(tf.host_flow(f))
                 if cr is not None:
                     grays.append(cr.gray(f))
@@ -106,6 +115,8 @@ class LiveEditor:
                         # the frame at a cut (`Carry.plan` will find the same one): its embedding starts on the side
                         # now, not once the rest of the batch has arrived
                         early = (len(frames) - 1, SideEmbedding(self.ed._make_embedding, f.copy(), self.ed.side_stream))
+                if job is not None:
+                    tfl.append(job.result())
             if cr is not None:
                 ref = grays[-1]
             self._ready.put((frames, tfl if tf is not None else None, (grays, res) if cr is not None else None, early))
