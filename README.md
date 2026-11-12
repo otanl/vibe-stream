@@ -267,11 +267,14 @@ Batch 2 with the face pass used to fall behind a 30 fps source: the host spent 6
 67 ms the source leaves. What remains is GPU time, mostly the transformer: per frame it costs 11.6 ms at batch 2 and
 8.6 ms at batch 8, since the matrix products at batch 2 are too small to fill the GPU.
 
+Batch 1 (engines built for it; the transformer takes 13.4 ms per frame and step) leaves no wait for the rest of a
+batch: the delay is 28 / 30 ms, 27 ms from a frame to its result, and offline the loop runs at 51.3 fps. With the face
+pass it is 83 / 86 ms (offline 32.5 fps, little above the source's 30), so there batch 2 does better.
+
 With this student, smaller batches flicker more and come out sharper (with `lam4` above, warping error and Sobel went
-down instead). Each batch starts
-from the last output of the one before, and its single step redraws the high band, so with smaller batches that
-redraw comes two or four times as often. A slightly stronger filter at batch 2 makes up for it. On the 4 evaluation
-clips (ping-pong, 96 frames) x oil / anime / ukiyo-e / night / gouache / autumn:
+down instead). Each batch starts from the last output of the one before, and its single step redraws the high band,
+so with smaller batches that redraw comes two, four or eight times as often. A slightly stronger filter makes up for
+it. On the 4 evaluation clips (ping-pong, 96 frames) x oil / anime / ukiyo-e / night / gouache / autumn:
 
 | Batch, filter | CLIP direction | Flicker (low / high) | Warping error | Sobel |
 |---|---:|---:|---:|---:|
@@ -280,9 +283,12 @@ clips (ping-pong, 96 frames) x oil / anime / ukiyo-e / night / gouache / autumn:
 | 2, 0.7 / 0.3 | 0.156 | 8.04 (2.77 / 7.22) | 11.17 | 10.76 |
 | 2, 0.7 / 0.4 | 0.156 | 7.41 (2.70 / 6.59) | 10.58 | 10.10 |
 | 2, 0.75 / 0.45 | 0.156 | 7.07 (2.59 / 6.29) | 10.26 | 9.78 |
+| 1, 0.7 / 0.3 | 0.156 | 7.95 (2.77 / 7.11) | 11.10 | 10.60 |
+| 1, 0.7 / 0.4 | 0.156 | 7.33 (2.71 / 6.50) | 10.52 | 9.96 |
 
-Batch 2 with 0.7 / 0.4 is batch 8's picture at a quarter of the delay. On an RTX 3090 Ti it keeps up with 30 fps
-with the face pass too; weaker GPUs have not been tried yet.
+With a filter of 0.7 / 0.4, batch 2 gives batch 8's picture at a quarter of the delay and batch 1 at an eighth (28 ms,
+less than a frame's interval). On an RTX 3090 Ti both keep up with 30 fps; with the face pass, batch 2. Weaker GPUs
+have not been tried yet.
 
 **Re-embedding at cuts without a stall.** At a cut the instruction is embedded again with the frame after it ("Flicker",
 carry-over), and live the stream waits for it: at 640 on the 3090 Ti (fp16 engine) the cut batch comes out about

@@ -35,8 +35,9 @@ waits.
 Delay at a 30 fps source, the INT8 engines with carry-over + filter (scripts/measure_latency.py), mean / 95th
 percentile: at 768 batch 8 298 / 415 ms, batch 4 150 / 201 ms, batch 2 80 / 98 ms (batch 1, 26 fps, falls behind);
 at 640 250 / 368, 128 / 178 and 68 / 87 ms. With the commercial student at 640 (pruned, INT8, `--fast_post`) and the
-engines replayed as CUDA graphs: 229 / 346, 116 / 167 and 60 / 78 ms; with the face pass 262 / 379, 139 / 191 and
-78 / 96 ms (README, "Shorter paths inside a batch": at batch 2 a filter of 0.7 / 0.4 matches batch 8's flicker).
+engines replayed as CUDA graphs: 229 / 346, 116 / 167 and 60 / 78 ms, batch 1 28 / 30 ms; with the face pass 262 /
+379, 139 / 191, 78 / 96 and 83 / 86 ms (README, "Shorter paths inside a batch": at batch 2 and 1 a filter of 0.7 / 0.4
+matches batch 8's flicker).
 """
 
 from __future__ import annotations
