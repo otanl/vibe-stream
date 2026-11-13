@@ -642,7 +642,9 @@ DAVIS-trained weights:
 
 - Windows (`sav_probe.py`, `sav_windows.py`): 200 windows of 10 frames drawn from 1841 SA-V clips (two of its
   archives: 24 fps, 10-19 s, 72 % portrait; centre-cropped to a square), from clips with a median motion of 1.5-30 px
-  per two frames at 768; the 72 drawn from clips slower than 5 px take every second frame.
+  per two frames at 768; the 72 drawn from clips slower than 5 px take every second frame. SA-V's videos come with
+  every face blurred (YuNet still finds them), so no window shows a sharp face; what that costs is under
+  "Negative results".
 - Teacher (`klein_teacher.py`): Klein, 4 steps, every frame edited on its own, 5 of the 14 training instructions per
   window (31 s per window x instruction at 768, 8 h in all). Of the Apache-2.0 editing models tried as teachers on the
   evaluation clips, Klein scored the highest CLIP direction (0.192, VIBE's 8-step output 0.183) with sharper texture
@@ -1159,7 +1161,16 @@ a mismatch is refused.
       5.95.
   - Per instruction, nothing moves by more than night's flicker (1.44 → 1.30), and ukiyo-e keeps the photo's colours.
   - Interpretation: the amount of data is not what limits this student. Faces in particular stay noisy. Klein's
-    targets are made frame by frame and redraw a face each time; whether that is the cause has not been tested.
+    targets are made frame by frame and redraw a face each time.
+  - SA-V's faces are blurred at the source, so the new face windows only added blurred faces. On 32 DAVIS-2017
+    windows with faces (evaluation only), Klein's edit of each frame as recorded and with the faces blurred the
+    way SA-V's are:
+    - The face region's change in Klein's output is 24.0 / 26.3 (anime, sharp / blurred faces) and 16.9 / 18.8
+      (oil). The input's is 3.8 / 1.8, and the whole frame's about 12-14 in all four outputs. The blur accounts
+      for a tenth of the teacher's face flicker; the rest is Klein redrawing the face every frame.
+    - What the blur does change is correspondence. On sharp faces Klein keeps glasses, the turn of the head and
+      the expression; on blurred ones it draws a generic face. A student trained on SA-V is taught that what is
+      inside a face does not matter.
 - **Holding detail where the input does not change.** Small moving detail, faces above all, flickers because each
   frame's carried step redraws it. Three ways to hold it, judged on the 640 path (carry-over + filter 0.7 / 0.3):
   - At run time, a filter that holds the high band where the output jumps while the input is explained by its motion,
@@ -1181,6 +1192,9 @@ a mismatch is refused.
   - Pilot of a cheap stand-in for the face pass: a 1.8 M-parameter U-Net, 1.6 ms per crop. It learns the face pass's
     edit from the input crop and the stream's own output there, on 9,500 crops of 100 SA-V windows. LPIPS to the
     face pass is 0.27 against 0.50 for the stream's output, but the faces are smeared: it does not draw eyes.
+    Wider (4.0 M parameters, 2.5 ms per crop), with a PatchGAN discriminator, trained on 29,000 crops of 400 windows:
+    LPIPS 0.23. Hair and outlines are firmer, but there are still no eyes or mouths. Its crops are SA-V's, so it
+    learned to turn a blurred face into the face pass's face.
 
 ## Reference: SANA-Streaming
 
