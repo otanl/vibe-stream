@@ -86,6 +86,11 @@ def main():
     p.add_argument("--face_tae_engine", default=None, help="with --face_engine: taesana engines at the crop size")
     p.add_argument("--face_model", default=str(ROOT / "models/face_detection_yunet_2023mar.onnx"),
                    help="with --face_engine: YuNet face detector (OpenCV model zoo)")
+    p.add_argument("--packed_engine", default=None,
+                   help="with --face_engine main and batch 1: the face crop rides along in the frame's transformer call "
+                        "(build_trt_packed.py, vibe_stream.packed)")
+    p.add_argument("--face_every", type=int, default=1,
+                   help="with --packed_engine: edit the crop on every n-th frame, its last edit warped in between")
     p.add_argument("--out_json", default=None)
     a = p.parse_args()
     prompt = PROMPTS.get(a.prompt, a.prompt)
@@ -132,10 +137,14 @@ def main():
             face_engine = TRTTransformer(a.face_engine)
         face = FacePass(vibe, face_engine,
                         TRTTinyAutoencoder(a.face_tae_engine) if a.face_tae_engine else TinyAutoencoder(), a.face_model)
-    ed = StreamEditor(vibe, tae, engine=engine, student=a.student, batch_size=a.batch, temporal_filter=tf,
-                      carry=(Carry(a.keyframe_every, sigma=a.carry_sigma, fill=a.carry_fill, fast=a.fast_post)
-                             if a.carry else None),
-                      reembed_async=a.reembed_async, face=face)
+    kw = {}
+    if a.packed_engine:
+        from vibe_stream.packed import PackedEngine, PackedStreamEditor
+        kw = dict(packed=PackedEngine(a.packed_engine), face_every=a.face_every)
+    ed = (PackedStreamEditor if kw else StreamEditor)(
+        vibe, tae, engine=engine, student=a.student, batch_size=a.batch, temporal_filter=tf,
+        carry=Carry(a.keyframe_every, sigma=a.carry_sigma, fill=a.carry_fill, fast=a.fast_post) if a.carry else None,
+        reembed_async=a.reembed_async, face=face, **kw)
     scratch = None
     if a.share_scratch:
         from vibe_stream.trt_engine import share_scratch

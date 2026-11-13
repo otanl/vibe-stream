@@ -76,13 +76,17 @@ def main():
     p.add_argument("--face_tae_engine", default=None, help="with --face_engine: taesana engines at the crop size")
     p.add_argument("--face_model", default=str(ROOT / "models/face_detection_yunet_2023mar.onnx"),
                    help="with --face_engine: YuNet face detector (OpenCV model zoo)")
+    p.add_argument("--packed_engine", default=None,
+                   help="with --face_engine main: the face crop rides along in the frame's call (build_trt_packed.py)")
+    p.add_argument("--face_every", type=int, default=1,
+                   help="with --packed_engine: edit the crop on every n-th frame, its last edit warped in between")
     p.add_argument("--check", action="store_true", help="compare the outputs with StreamEditor.run's")
     p.add_argument("--out_json", default=None)
     a = p.parse_args()
     eng = TRTTransformer(a.engine)
     size, B = eng.spec.size, eng.spec.batch
     frames = list(islice(cycle(read_video_frames(a.input, size)), a.frames // B * B))
-    vibe = VibeModel(size=size)
+    vibe = VibeModel(size=size, denoiser_on_gpu=False)    # the engines stand in for VIBE's PyTorch transformer
     face = None
     if a.face_engine:
         from vibe_stream.face import FacePass
@@ -92,10 +96,14 @@ def main():
                        else TRTTransformer(a.face_engine))
         face = FacePass(vibe, face_engine,
                         TRTTinyAutoencoder(a.face_tae_engine) if a.face_tae_engine else TinyAutoencoder(), a.face_model)
-    ed = StreamEditor(vibe, TRTTinyAutoencoder(a.tae_engine), engine=eng,
-                      temporal_filter=TemporalFilter(*a.temporal_filter, fast=a.fast_post) if a.temporal_filter else None,
-                      carry=Carry(0, fast=a.fast_post) if a.carry else None, reembed_async=a.reembed_async,
-                      face=face)
+    kw = {}
+    if a.packed_engine:
+        from vibe_stream.packed import PackedEngine, PackedStreamEditor
+        kw = dict(packed=PackedEngine(a.packed_engine), face_every=a.face_every)
+    ed = (PackedStreamEditor if kw else StreamEditor)(
+        vibe, TRTTinyAutoencoder(a.tae_engine), engine=eng,
+        temporal_filter=TemporalFilter(*a.temporal_filter, fast=a.fast_post) if a.temporal_filter else None,
+        carry=Carry(0, fast=a.fast_post) if a.carry else None, reembed_async=a.reembed_async, face=face, **kw)
     ed.set_prompt(PROMPTS.get(a.prompt, a.prompt), frames[0])
     offline, tm = ed.run(frames, 2)   # warm-up; the same batch size's offline loop rate for reference
     path = "carry-over + filter" if a.carry and a.temporal_filter else "carry-over" if a.carry else \
@@ -105,7 +113,8 @@ def main():
     if a.reembed_async:
         path += " (async re-embedding)"
     if face is not None:
-        path += " + face pass"
+        path += " + face pass" + (" (riding along" + (f", every {a.face_every} frames)" if a.face_every > 1 else ")")
+                                  if a.packed_engine else "")
     res = dict(engine=a.engine, size=size, batch=B, path=path, offline_loop_fps=tm.loop_fps, runs={})
     for fps in a.fps:
         delay, after, outs = measure(ed, frames, fps)

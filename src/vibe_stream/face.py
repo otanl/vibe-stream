@@ -415,6 +415,13 @@ class FacePass:
         (the StreamEditor); returns the result, same layout. The instruction is embedded with a face crop (the
         embedding depends on the image, and one made with the whole frame gives worse faces), the first time a face
         is pasted after the main editor's own embedding was made (a clip's start, a cut)."""
+        if not self.begin(fb, main):
+            return out
+        return self.paste(out, fb, self.ed.process(fb.crops, fb.flows, fb.plan))
+
+    def begin(self, fb: FaceBatch, main) -> bool:
+        """The crop editor's embedding for this batch (see `apply`); False when there is no face pass this batch
+        (with `main.reembed_async` live, until the first face embedding made on the side is ready)."""
         ed = self.ed
         if self._emb is None or self._emb_for is not main.emb:
             ed._prompt, ed._reference = main._prompt, main._reference
@@ -426,7 +433,7 @@ class FacePass:
                     self._side_for = main.emb
                 if self._emb is None:
                     self._restart = True
-                    return out
+                    return False
             else:
                 t0 = time.perf_counter()
                 ed._embed(fb.probe)
@@ -434,7 +441,11 @@ class FacePass:
                 self.embed_ms.append(1000 * (time.perf_counter() - t0))
                 self._emb, self._emb_for = (ed.emb, ed.enc16), main.emb
         ed.emb, ed.enc16 = self._emb
-        crop_out = ed.process(fb.crops, fb.flows, fb.plan)
+        return True
+
+    @torch.inference_mode()
+    def paste(self, out: torch.Tensor, fb: FaceBatch, crop_out: torch.Tensor) -> torch.Tensor:
+        """The batch's edited crops (B, Z, Z, 3) uint8 pasted into `out` (see `apply`)."""
         B, H, W = out.shape[:3]
         Z = self.size
         cx, cy, fw = fb.boxes_gpu[:, 0], fb.boxes_gpu[:, 1], fb.boxes_gpu[:, 2]

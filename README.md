@@ -289,10 +289,12 @@ of 255) at batch 4, 2 and 1, part of which is the batch-8 engine's own run-to-ru
 | 1, 0.7 / 0.3 | 0.157 | 7.25 (2.58 / 6.51) | 10.58 | 9.79 |
 | 1, 0.7 / 0.4 | 0.156 | 6.69 (2.52 / 5.95) | 10.05 | 9.22 |
 
-Batch 1 is batch 8's picture at about a ninth of the delay (26 ms, less than a frame's interval) and keeps up with 30
-fps on an RTX 3090 Ti with the face pass too (44 ms here; 50-80 ms on average over the first seconds of other DAVIS
-clips with people). On an RTX 4060 Ti batch 1 comes back after 32 / 33 ms (offline 38.7 fps; batch 8 341 / 455 ms),
-while the face pass falls behind a 30 fps source at any batch size (offline 25 fps at batch 1, 31 at batch 8).
+Batch 1 is batch 8's picture at about a ninth of the delay (26 ms, less than a frame's interval). With the face pass
+an RTX 3090 Ti is at the edge of a 30 fps source at batch 1 (offline 33-35 fps). The table's run came back after 44 /
+47 ms, but repeated runs of the same setup range from 45 to 117 ms on average and sometimes fall behind. On the first
+seconds of other DAVIS clips with people the delay was 50-80 ms. On an RTX 4060 Ti batch 1 comes back after 32 / 33
+ms (offline 38.7 fps; batch 8 341 / 455 ms), while the face pass falls behind a 30 fps source at any batch size
+(offline 25 fps at batch 1, 31 at batch 8).
 
 At 768 (the round-2 commercial student `klein_sav_vnight_cont_768`, all 20 blocks; per frame and step the transformer
 takes 13.8 ms at batch 8 and 19.5 at batch 1) the RTX 3090 Ti returns a frame 40 / 43 ms after it arrives at batch 1
@@ -782,6 +784,37 @@ four runs in a row of the same setup that afternoon; the engines alone, timed at
 call.) It depends on the student: the DAVIS `multi_carry_s05_lut_2step_768` at 256 draws hollow eyes and blurred
 faces. One face per frame; crowds keep theirs.
 
+**One call for the frame and the face.** The crop costs more than its share of the work. Its 64 tokens (at 256)
+against the frame's 400 make a call of the whole transformer, about a thousand short kernels. `vibe_stream.packed` runs
+both in one call (`build_trt_packed.py`, `--packed_engine`):
+
+- The per-token layers (projections, norms and modulation, the Mix-FFN's 1x1 convolutions) run once over the joined
+  sequence.
+- The layers that mix tokens run per image: the linear self-attention's K^T V sum, the cross-attention (each image
+  with its own instruction embedding) and the Mix-FFN's depthwise convolution.
+- Each image has its own timestep.
+
+Each image's velocity is its own call's within 0.1-0.2 % (fp16). Through the stream the output is the separate face
+pass's at 51 dB PSNR. Per call at batch 1:
+
+| | RTX 4060 Ti, fp16 | 4060 Ti, INT8 | RTX 3090 Ti, fp16 | 3090 Ti, INT8 |
+|---|---:|---:|---:|---:|
+| Frame | 26.7 ms | 18.1 ms | 17.9 ms | 12.2 ms |
+| Crop, a call of its own | 13.7 ms | 9.5 ms | 5.8 ms | 5.2 ms |
+| Frame + crop, two calls | 40.0 ms | 27.2 ms | 23.5 ms | 17.3 ms |
+| Frame + crop, one call | 31.8 ms | 23.0 ms | 20.5 ms | 15.7 ms |
+
+The crop's extra cost drops by 30-60 %, toward its 16 % share of the tokens. The transformer is only part of the face
+pass's cost, though:
+
+- RTX 4060 Ti: the stream with the face pass goes from 25.5 to 29.1 fps offline, still short of a 30 fps source. The
+  frame alone takes 77 % of a frame's time there, and the rest of the face pass (the crop's encoding and decoding,
+  carry-over, filter and paste) adds about 4 ms.
+- `--face_every 2` edits the crop on every second frame and pastes its last edit, warped, in between: 30.1 fps, 30.6
+  with a 192 crop. Neither is quite enough.
+- RTX 3090 Ti: the offline loop stays at 33-35 fps either way, and live at batch 1 both versions sit at the edge of
+  30 fps (45-117 ms over repeated runs). There detection and the crop's other work set the pace.
+
 ## Setup
 
 The code expects an upstream VIBE checkout next to it (or `VIBE_REPO` pointing at one) and the weights in `models/`:
@@ -945,9 +978,14 @@ python scripts/build_trt.py --student runs/klein640_prune14_18/lora.safetensors 
     --engine out/trt/vibe_klein640_prune14_18_b1_int8.engine --int8 --batch 1 --calib_clips 25 --extra_sizes 256
 python scripts/measure_latency.py --engine out/trt/vibe_klein640_prune14_18_b1_int8.engine \
     --tae_engine out/trt/taesana_640_b1 --carry --temporal_filter 0.7 0.3 --fast_post --reembed_async
-# ... with the face pass (optional; 44-80 ms on average instead of 26, depending on the clip)
+# ... with the face pass (optional; on the 3090 Ti at the edge of 30 fps, 45-117 ms over repeated runs)
 python scripts/measure_latency.py ... --face_engine main --face_tae_engine out/trt/taesana_256_b1 \
     --face_model out/trt/yunet_640.engine
+# ... the face crop riding along in the frame's transformer call (vibe_stream.packed; batch 1)
+python scripts/build_trt_packed.py --student runs/klein640_prune14_18/lora.safetensors \
+    --engine out/trt/vibe_klein640_prune14_18_packed256_int8.engine --int8
+python scripts/measure_latency.py ... --face_engine main --face_tae_engine out/trt/taesana_256_b1 \
+    --face_model out/trt/yunet_640.engine --packed_engine out/trt/vibe_klein640_prune14_18_packed256_int8.engine
 ```
 
 A student is tied to its resolution and its init noise (stored in the file). Other instructions than the ones it was
@@ -973,6 +1011,7 @@ a mismatch is refused.
   - `temporal_filter.py`: display-side two-band temporal filter
   - `carry.py`: carry-over of the previous output into the next batch's start
   - `face.py`: face pass (detection, tracking, the face crop edited at 256 and pasted back)
+  - `packed.py`: the face crop riding along in the frame's transformer call (packed graph, engine, editor)
   - `presets.py`: instructions (also Klein's wordings and the broad self-distilled set) and clip sets
   - `state_attn.py`: self-attention state carried from frame to frame (experimental, Negative results)
   - `metrics.py`: video I/O, warping error, flicker split, Sobel, edge agreement, LPIPS, CLIP scores

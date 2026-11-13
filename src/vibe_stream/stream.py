@@ -239,6 +239,24 @@ class StreamEditor:
         output (B, H, W, 3) uint8, weight (B, 1, h, w) on the latent grid, fill (B, H, W, 3) uint8 or None for the
         frames) one step runs, from (1 - s) * (w * enc(warped) + (1 - w) * enc(fill)) + s * noise, s from
         `carry_start` (see `carry`)."""
+        steps = self.edit_steps(frames, carry)
+        try:
+            x, il, t = next(steps)
+            while True:
+                x, il, t = steps.send(self.velocity(x, il, t))
+        except StopIteration as done:
+            return done.value
+
+    def velocity(self, x: torch.Tensor, il: torch.Tensor, t) -> torch.Tensor:
+        """The transformer's velocity (fp32) for latents x and reference latents il: the engine, else PyTorch."""
+        if self.engine is not None:
+            return self.engine(torch.cat([x.half(), il], 1), self.enc16, t).float()
+        return self.vibe.velocity(x, il, self.emb, t)
+
+    def edit_steps(self, frames: torch.Tensor, carry=None):
+        """`edit` as a generator: yields (x, reference latents, t) for each transformer call and is sent the velocity;
+        returns the decoded frames. `vibe_stream.packed` runs two of them, the frame's and a face crop's, through one
+        engine call."""
         if self.emb is None:
             raise RuntimeError("call set_prompt first")
         il = self.tae.encode_u8(frames)
@@ -253,10 +271,7 @@ class StreamEditor:
             x = (1 - s) * (w * self.tae.encode_u8(guess).float() + (1 - w) * zf.float()) + s * x
             plan = [(t, s, self.sigmas[-1])]
         for t, s0, s1 in plan:
-            if self.engine is not None:
-                v = self.engine(torch.cat([x.half(), il], 1), self.enc16, t).float()
-            else:
-                v = self.vibe.velocity(x, il, self.emb, t)
+            v = yield x, il, t
             x = flow_step(x, v, s0, s1)
         return self.tae.decode_u8(x)
 
