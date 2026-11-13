@@ -181,6 +181,14 @@ def merge(model: nn.Module, state: Dict[str, torch.Tensor]) -> int:
     names = layer_names(state)
     if not names:
         raise ValueError("LoRA file holds no '<layer>.lora_A' entries")
+    # a student trained without some transformer blocks has no entries for them; merged into a model that still has
+    # them, those blocks would run VIBE's own weights (a file that does not record its removed blocks)
+    have = {int(m.group(1)) for n in names if (m := re.match(r"transformer_blocks\.(\d+)\.", n))}
+    blocks = getattr(model, "transformer_blocks", None)
+    missing = [i for i, b in enumerate(blocks or []) if i not in have and hasattr(b, "attn1")] if have else []
+    if missing:
+        raise ValueError(f"the LoRA has no entries for transformer blocks {missing}, which the model still has: a "
+                         f"student trained without them (VibeModel(remove_blocks=...), --remove_blocks)")
     with torch.no_grad():
         for name in names:
             w = model.get_submodule(name).weight

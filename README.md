@@ -231,8 +231,9 @@ network at the same speed, "Many instructions"), mean / 95th percentile, two rou
 | 2 | 80 / 98 ms | 35.8 | 68 / 87 ms | 40.8 |
 | 1 | falls behind | 26 | | |
 
-A frame waits for the rest of its batch, up to (batch - 1) / 30 s, and then for the batch itself, so batch 2 is the
-shortest delay that still keeps up with 30 fps, and batch 4 keeps more headroom (46 fps at 768) for a busier GPU.
+A frame waits for the rest of its batch, up to (batch - 1) / 30 s, and then for the batch itself, so batch 2 was the
+shortest delay that kept up with 30 fps (batch 1 does since the changes below), and batch 4 keeps more headroom (46
+fps at 768) for a busier GPU.
 Smaller batches carry the previous output over a shorter distance: warping error 9.93 / 9.57 / 9.57 at 768 and
 9.52 / 9.13 / 9.21 at 640 (batch 8 / 4 / 2), Sobel a little lower (8.98 / 8.90 / 8.82 and 9.21 / 8.98 / 8.95).
 The INT8 engines for batch 4 and 2 at 768 and for batch 8 at 640 are not bit-reproducible from run to run
@@ -242,11 +243,12 @@ differ by LPIPS 0.01); the INT8 engines for 768 batch 8 and the fp16 engines are
 source of run-to-run variation, now removed: the colour map of the LUT fill was summed with atomic adds (`Carry`'s
 `fit_colour_map`).
 
-**Shorter paths inside a batch.** Measured on the live path at 640 at batch 2, with the commercial student
-(`klein640_prune14_18` INT8 with the 256 profile for faces, `--fast_post`, carry-over + filter 0.7 / 0.3, `breakdance`
-at 30 fps): 51 ms pass between a batch's last frame and its result. Of these, 11 ms are that frame's host flows,
-the filter's (4.6 ms) and then the carry-over's (5.9 ms). The other 39 ms are on the GPU: the transformer 24.5, the
-decoder 5.4, the three encoder calls 2.5, the carry-over's start 2.7 and the filter 1.2. Two changes shorten this:
+**Shorter paths inside a batch.** Measured on the live path at 640 at batch 2 (`breakdance` at 30 fps, carry-over +
+filter 0.7 / 0.3, `--fast_post`; an INT8 engine of `klein640_prune14_18` that still had blocks 14 and 18, built from a
+file that did not record their removal), 51 ms pass between a batch's last frame and its result. Of these, 11 ms are
+that frame's host flows, the filter's (4.6 ms) and then the carry-over's (5.9 ms). The other 39 ms are on the GPU: the
+transformer 24.5, the decoder 5.4, the three encoder calls 2.5, the carry-over's start 2.7 and the filter 1.2. Two
+changes shorten this:
 
 - `LiveEditor` now computes the filter's flow on a worker beside the carry-over's, which cuts the 11 ms to 6.
 - The TensorRT runners replay their calls as CUDA graphs (`trt_engine.capture`).
@@ -255,40 +257,41 @@ decoder 5.4, the three encoder calls 2.5, the carry-over's start 2.7 and the fil
     the pace.
   - Output is identical bit for bit (768 batch 8 INT8 engine).
 
-Same runs, before / after:
+On the batch-8 engine (`klein640_prune14_18` INT8 with the 256 profile for faces), before / after: delay 237 / 354 →
+229 / 346 ms, last frame to result 121 → 113 ms, offline loop 77.1 → 78.7 fps; with the face pass 272 / 390 → 262 /
+379 ms, 155 → 145 ms and 57.4 → 62.9 fps. At batch 2 (the engine above) the face pass used to fall behind a 30 fps
+source, the host spending 66 ms queueing each batch against the 67 ms the source leaves; it now keeps up.
+
+With both changes and an engine per batch size (`build_trt.py --batch B --extra_sizes 256 --remove_blocks 14,18`;
+per frame and step the transformer takes 8.5, 8.9, 10.5 and 11.7 ms at batch 8, 4, 2 and 1, whose smaller matrix
+products fill the GPU less), same runs:
 
 | Batch | Delay | Last frame to result | Offline loop | With face pass: delay | Last frame to result | Offline loop |
 |---|---:|---:|---:|---:|---:|---:|
-| 8 | 237 / 354 → 229 / 346 ms | 121 → 113 ms | 77.1 → 78.7 fps | 272 / 390 → 262 / 379 ms | 155 → 145 ms | 57.4 → 62.9 fps |
-| 4 | 125 / 175 → 116 / 167 ms | 74 → 66 ms | 64.3 → 71.0 fps | 153 / 207 → 139 / 191 ms | 103 → 90 ms | 43.7 → 54.5 fps |
-| 2 | 68 / 86 → 60 / 78 ms | 51 → 43 ms | 54.7 → 59.1 fps | falls behind → 78 / 96 ms | 216 → 61 ms | 30.4 → 41.8 fps |
+| 8 | 229 / 346 ms | 112 ms | 79.0 fps | 262 / 379 ms | 145 ms | 62.9 fps |
+| 4 | 111 / 162 ms | 61 ms | 76.3 fps | 134 / 186 ms | 84 ms | 57.7 fps |
+| 2 | 56 / 74 ms | 39 ms | 64.0 fps | 73 / 91 ms | 56 ms | 45.5 fps |
+| 1 | 26 / 28 ms | 26 ms | 54.8 fps | 44 / 47 ms | 44 ms | 34.5 fps |
 
-Batch 2 with the face pass used to fall behind a 30 fps source: the host spent 66 ms queueing each batch against the
-67 ms the source leaves. What remains is GPU time, mostly the transformer: per frame it costs 11.6 ms at batch 2 and
-8.6 ms at batch 8, since the matrix products at batch 2 are too small to fill the GPU.
+At batch 1 no frame waits for others: what remains is the frame's own host flows and its pass through the engines.
 
-Batch 1 (engines built for it; the transformer takes 13.4 ms per frame and step) leaves no wait for the rest of a
-batch: the delay is 28 / 30 ms, 27 ms from a frame to its result, and offline the loop runs at 51.3 fps. With the face
-pass it is 83 / 86 ms (offline 32.5 fps, little above the source's 30), so there batch 2 does better.
-
-With this student, smaller batches flicker more and come out sharper (with `lam4` above, warping error and Sobel went
-down instead). Each batch starts from the last output of the one before, and its single step redraws the high band,
-so with smaller batches that redraw comes two, four or eight times as often. A slightly stronger filter makes up for
-it. On the 4 evaluation clips (ping-pong, 96 frames) x oil / anime / ukiyo-e / night / gouache / autumn:
+The batch size barely changes the picture. Each batch starts from the last output of the one before, so a smaller
+batch only changes where the carried step starts from. On the 4 evaluation clips (ping-pong, 96 frames) x oil / anime
+/ ukiyo-e / night / gouache / autumn the outputs differ from batch 8's by 2.9, 4.1 and 5.1 (mean absolute difference,
+of 255) at batch 4, 2 and 1, part of which is the batch-8 engine's own run-to-run variation (above), and as with
+`lam4` above the smaller batches come out marginally steadier and softer:
 
 | Batch, filter | CLIP direction | Flicker (low / high) | Warping error | Sobel |
 |---|---:|---:|---:|---:|
-| 8, 0.7 / 0.3 | 0.156 | 7.38 (2.57 / 6.64) | 10.65 | 9.96 |
-| 4, 0.7 / 0.3 | 0.156 | 8.13 (2.78 / 7.31) | 11.27 | 10.86 |
-| 2, 0.7 / 0.3 | 0.156 | 8.04 (2.77 / 7.22) | 11.17 | 10.76 |
-| 2, 0.7 / 0.4 | 0.156 | 7.41 (2.70 / 6.59) | 10.58 | 10.10 |
-| 2, 0.75 / 0.45 | 0.156 | 7.07 (2.59 / 6.29) | 10.26 | 9.78 |
-| 1, 0.7 / 0.3 | 0.156 | 7.95 (2.77 / 7.11) | 11.10 | 10.60 |
-| 1, 0.7 / 0.4 | 0.156 | 7.33 (2.71 / 6.50) | 10.52 | 9.96 |
+| 8, 0.7 / 0.3 | 0.157 | 7.38 (2.57 / 6.64) | 10.65 | 9.96 |
+| 4, 0.7 / 0.3 | 0.157 | 7.32 (2.56 / 6.59) | 10.60 | 9.89 |
+| 2, 0.7 / 0.3 | 0.156 | 7.30 (2.56 / 6.57) | 10.59 | 9.90 |
+| 1, 0.7 / 0.3 | 0.157 | 7.25 (2.58 / 6.51) | 10.58 | 9.79 |
+| 1, 0.7 / 0.4 | 0.156 | 6.69 (2.52 / 5.95) | 10.05 | 9.22 |
 
-With a filter of 0.7 / 0.4, batch 2 gives batch 8's picture at a quarter of the delay and batch 1 at an eighth (28 ms,
-less than a frame's interval). On an RTX 3090 Ti both keep up with 30 fps; with the face pass, batch 2. Weaker GPUs
-have not been tried yet.
+Batch 1 is batch 8's picture at about a ninth of the delay (26 ms, less than a frame's interval) and keeps up with 30
+fps on an RTX 3090 Ti with the face pass too (44 ms here; 50-80 ms on average over the first seconds of other DAVIS
+clips with people). Weaker GPUs have not been tried yet.
 
 **Re-embedding at cuts without a stall.** At a cut the instruction is embedded again with the frame after it ("Flicker",
 carry-over), and live the stream waits for it: at 640 on the 3090 Ti (fp16 engine) the cut batch comes out about
@@ -753,7 +756,7 @@ input's flow, where that flow holds) drops from 9.8 to 5.6 (the input's own: 3.2
 blotched. The eyes and brows still move a little. On an RTX 3090 Ti (`breakdance`) it costs 4.7 ms per frame on the
 GPU (loop 75 to 58 fps), one more text-encoder run per clip (about 160 ms) and a second copy of the transformer's
 weights (1.9 GB in INT8); live at a 30 fps source the delay goes from 243 / 360 to 284 / 400 ms (mean / 95th
-percentile; batch 2 with the engines replayed as CUDA graphs: 60 / 78 to 78 / 96 ms, Speed, "Shorter paths inside a
+percentile; batch 1 with the engines replayed as CUDA graphs: 26 / 28 to 44 / 47 ms, Speed, "Shorter paths inside a
 batch"). YuNet runs as a TensorRT engine (`build_trt_yunet.py`, 4.4 ms per frame at 640 on an idle GPU, the same
 faces as OpenCV's) or through OpenCV on the host (11 ms at 384); either way detection, crops and their flows run on a
 thread beside the stream. Which is faster depends on the GPU's headroom: on the 3090 Ti the engine (loop 57.0 against
@@ -928,6 +931,17 @@ python scripts/stream_video.py --input ... --engine out/trt/vibe_klein640_prune1
     --face_engine main --face_tae_engine out/trt/taesana_256_b8 --face_model out/trt/yunet_640.engine
 # ... or a separate engine for the crops (another student, e.g. the 768 one copied to 256 with resize_student.py)
 python scripts/stream_video.py --input ... --face_engine out/trt/vibe_klein_face_256_b8_int8.engine ...
+# Live (vibe_stream.live.LiveEditor; a frame back about 26 ms after it arrives on an RTX 3090 Ti): engines for batch 1.
+# measure_latency.py hands a file's frames over at 30 fps and reports the delay
+python scripts/build_trt_tae.py --size 640 --batch 1 --prefix out/trt/taesana_640_b1
+python scripts/build_trt_tae.py --size 256 --batch 1 --prefix out/trt/taesana_256_b1
+python scripts/build_trt.py --student runs/klein640_prune14_18/lora.safetensors \
+    --engine out/trt/vibe_klein640_prune14_18_b1_int8.engine --int8 --batch 1 --calib_clips 25 --extra_sizes 256
+python scripts/measure_latency.py --engine out/trt/vibe_klein640_prune14_18_b1_int8.engine \
+    --tae_engine out/trt/taesana_640_b1 --carry --temporal_filter 0.7 0.3 --fast_post --reembed_async
+# ... with the face pass (optional; 44-80 ms on average instead of 26, depending on the clip)
+python scripts/measure_latency.py ... --face_engine main --face_tae_engine out/trt/taesana_256_b1 \
+    --face_model out/trt/yunet_640.engine
 ```
 
 A student is tied to its resolution and its init noise (stored in the file). Other instructions than the ones it was
