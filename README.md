@@ -1160,6 +1160,27 @@ a mismatch is refused.
   - Per instruction, nothing moves by more than night's flicker (1.44 → 1.30), and ukiyo-e keeps the photo's colours.
   - Interpretation: the amount of data is not what limits this student. Faces in particular stay noisy. Klein's
     targets are made frame by frame and redraw a face each time; whether that is the cause has not been tested.
+- **Holding detail where the input does not change.** Small moving detail, faces above all, flickers because each
+  frame's carried step redraws it. Three ways to hold it, judged on the 640 path (carry-over + filter 0.7 / 0.3):
+  - At run time, a filter that holds the high band where the output jumps while the input is explained by its motion,
+    with the filter's flow at 640. On `klein640_prune14_18`:
+    - Face change 10.15 → 5.94, as low as the face pass.
+    - Flicker 7.38 → 4.54.
+    - Sobel 9.96 → 6.88. Side by side the faces are steadier only by being softer.
+    - Flow at 640 without the hold lowers the face change only to 9.42.
+  - Training from `klein640_prune14_18` on the data and steps of `klein640_prune14_18_more` (reference: CLIP
+    direction 0.157, flicker 7.35, Sobel 9.96):
+    - With the carried step's agreement with the warped previous output four times as strong (`--carry_lam 16`):
+      CLIP direction 0.153, flicker 6.17, Sobel 8.20.
+    - With the teacher's terms switched off where the input's motion explains the frame, the warped output then
+      the only reference (`--carry_hold 0.9`, after TailSteer, arXiv:2611.06741): CLIP direction 0.156, flicker
+      6.67, Sobel 8.97.
+  - The high band's flicker per unit of Sobel stays at 0.67 in all of them: the students draw less detail, not
+    steadier detail. The face pass, which draws the face at a larger scale, is the one that steadies it without
+    blurring.
+  - Pilot of a cheap stand-in for the face pass: a 1.8 M-parameter U-Net, 1.6 ms per crop. It learns the face pass's
+    edit from the input crop and the stream's own output there, on 9,500 crops of 100 SA-V windows. LPIPS to the
+    face pass is 0.27 against 0.50 for the stream's output, but the faces are smeared: it does not draw eyes.
 
 ## Reference: SANA-Streaming
 

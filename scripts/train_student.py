@@ -35,7 +35,10 @@ last step runs from it (at --carry_sigma). That output gets the Huber and LPIPS 
 and --carry_lam (default lam) times an L1 against the warped output, weighted by the flow's weight. With probability
 --carry_rollout the carried output is itself carried once (through a frame between t and u), as in the steady state
 of the stream. --carry_fill lut fills in where the flow fails with frame u through the colour map of frame t's input
-and 2-step output, as `Carry(fill="lut")` does with the keyframe batch.
+and 2-step output, as `Carry(fill="lut")` does with the keyframe batch. --carry_hold H weighs the carried step's
+teacher terms by 1 - H * w (per latent token for the Huber term, per pixel for LPIPS): where the input's motion
+explains the frame, the warped output is the reference rather than the teacher's frame u, whose detail an image
+teacher redraws on every frame (after TailSteer's preservation of unchanged content, arXiv:2611.06741).
 
 Teacher data with reference styles (make_teacher_data.py --style_list) has keys s0, s1, ... whose reference differs
 per window; --ref_min_edge leaves out the (window, key) pairs whose teacher repainted the scene or copied the
@@ -123,6 +126,8 @@ def main():
                    help="noise level the carried step starts from (default: the last step's, 0.7496 for 2 steps)")
     p.add_argument("--carry_lam", type=float, default=None,
                    help="weight of the carried step's temporal term (default: --lam)")
+    p.add_argument("--carry_hold", type=float, default=0.0,
+                   help="carried step: weigh the teacher terms by 1 - carry_hold * w, w the flow's weight (0: off)")
     p.add_argument("--carry_fill", choices=["frame", "lut"], default="frame",
                    help="what fills in where the flow fails: the frame, or the frame through the colour map (carry.py)")
     p.add_argument("--carry_seq", type=int, default=1, help="consecutive frames carried from the same output")
@@ -202,6 +207,8 @@ def main():
     if a.grad_ckpt:
         m.tr.enable_gradient_checkpointing()
     lp = lpips.LPIPS(net="alex", verbose=False).to(m.device).eval().requires_grad_(False)
+    lp_map = (lpips.LPIPS(net="alex", spatial=True, verbose=False).to(m.device).eval().requires_grad_(False)
+              if a.carry_hold > 0 else None)
     opt = torch.optim.AdamW([{"params": params}] + ([{"params": [sc.logit], "lr": a.state_lr}] if sc else []),
                             lr=a.lr, weight_decay=0.0)
     sched = torch.optim.lr_scheduler.LambdaLR(
@@ -382,13 +389,23 @@ def main():
             tlat_c = torch.from_numpy(np.stack([d[f"tlat_{k}"][f] for _, d, k, _, f in runs])).to(dev)
             timg_c = torch.from_numpy(np.stack([d[f"timg_{k}"][f, Y:Y + S, X:X + S] for _, d, k, _, f in runs]))
             timg_c = timg_c.to(dev).permute(0, 3, 1, 2).float() / 127.5 - 1
+            wc = torch.from_numpy(np.stack([w[Y:Y + S, X:X + S] for _, w in st])).to(dev)[:, None]
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                l_clat = F.smooth_l1_loss(x0c, tlat_c, beta=0.1)
+                if a.carry_hold > 0:
+                    # where the input's motion explains the frame the carried output is the reference, not the
+                    # teacher's frame, which redraws detail independently on every frame
+                    keep = 1 - a.carry_hold * F.adaptive_avg_pool2d(
+                        torch.from_numpy(np.stack([w for _, w in st]))[:, None].to(dev), lat_n)
+                    l_clat = (F.smooth_l1_loss(x0c, tlat_c, beta=0.1, reduction="none") * keep).mean()
+                else:
+                    l_clat = F.smooth_l1_loss(x0c, tlat_c, beta=0.1)
                 dec_c = decode_crop(x0c, cy, cx)
-            l_clp = lp(dec_c[inner].clamp(-1, 1), timg_c[inner]).mean()
+            if a.carry_hold > 0:
+                l_clp = (lp_map(dec_c[inner].clamp(-1, 1), timg_c[inner]) * (1 - a.carry_hold * wc[inner])).mean()
+            else:
+                l_clp = lp(dec_c[inner].clamp(-1, 1), timg_c[inner]).mean()
             # agreement with the carried output where the flow holds (its own temporal term)
             g01 = torch.from_numpy(np.stack([g[Y:Y + S, X:X + S] for g, _ in st])).to(dev).permute(0, 3, 1, 2).float() / 255
-            wc = torch.from_numpy(np.stack([w[Y:Y + S, X:X + S] for _, w in st])).to(dev)[:, None]
             err = ((dec_c.clamp(-1, 1) + 1) / 2 - g01).abs().mean(1, keepdim=True)[inner]
             l_ct = (err * wc[inner]).sum() / wc[inner].sum().clamp_min(1.0)
             lam_c = a.lam if a.carry_lam is None else a.carry_lam
@@ -452,7 +469,8 @@ def main():
                                                      w_tex=a.w_tex, w_carry=a.w_carry,
                                                      carry_sigma=a.carry_sigma if a.w_carry > 0 else None,
                                                      carry_fill=a.carry_fill if a.w_carry > 0 else None,
-                                                     carry_lam=a.carry_lam, init=a.init, ref_min_edge=a.ref_min_edge,
+                                                     carry_lam=a.carry_lam, carry_hold=a.carry_hold, init=a.init,
+                                                     ref_min_edge=a.ref_min_edge,
                                                      carry_seq=a.carry_seq, state_carry=a.state_carry,
                                                      removed_blocks=m.removed_blocks))
     print(f"[train] saved {run / 'lora.safetensors'} after {time.perf_counter() - t0:.0f} s", flush=True)
