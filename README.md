@@ -1102,6 +1102,19 @@ a mismatch is refused.
 
   A temporally compressed latent needs a generator whose textures already agree from frame to frame, and an image
   teacher does not provide one. taew2_2's encoder also looks three frames ahead, which adds 100 ms in a live stream.
+- **Twice the training windows for the pruned 640 student.**
+  - What was added: 200 more SA-V windows, drawn from clips the first 200 did not use, half of them with a face 16
+    px or wider (YuNet; median 44 px).
+  - Their targets: Klein on 3 instructions each, night from VIBE's teacher, and 3 broad instructions each
+    self-distilled from the full student, packed as for `klein640_prune14_18`.
+  - Training: `klein640_prune14_18` trained on for 3000 steps on old and new windows together.
+  - Results, same evaluation (`eval_student_stream.py`, carry-over + filter 0.7 / 0.3):
+    - CLIP direction 0.156 → 0.157, flicker 7.42 → 7.35, Sobel 10.09 → 9.96.
+    - The face region's change on the people clips of "Faces", without the face pass: 9.73 → 9.84; with it, 5.87 →
+      5.95.
+  - Per instruction, nothing moves by more than night's flicker (1.44 → 1.30), and ukiyo-e keeps the photo's colours.
+  - Interpretation: the amount of data is not what limits this student. Faces in particular stay noisy. Klein's
+    targets are made frame by frame and redraw a face each time; whether that is the cause has not been tested.
 
 ## Reference: SANA-Streaming
 
