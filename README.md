@@ -291,7 +291,13 @@ of 255) at batch 4, 2 and 1, part of which is the batch-8 engine's own run-to-ru
 
 Batch 1 is batch 8's picture at about a ninth of the delay (26 ms, less than a frame's interval) and keeps up with 30
 fps on an RTX 3090 Ti with the face pass too (44 ms here; 50-80 ms on average over the first seconds of other DAVIS
-clips with people). Weaker GPUs have not been tried yet.
+clips with people). On an RTX 4060 Ti batch 1 comes back after 32 / 33 ms (offline 38.7 fps; batch 8 341 / 455 ms),
+while the face pass falls behind a 30 fps source at any batch size (offline 25 fps at batch 1, 31 at batch 8).
+
+At 768 (the round-2 commercial student `klein_sav_vnight_cont_768`, all 20 blocks; per frame and step the transformer
+takes 13.8 ms at batch 8 and 19.5 at batch 1) the RTX 3090 Ti returns a frame 40 / 43 ms after it arrives at batch 1
+(offline 35.7 fps; batch 8 287 / 404 ms), again with batch 8's picture (CLIP direction 0.163 against 0.161, flicker
+7.64 against 7.71, Sobel 10.25 against 10.42). With the face pass batch 1 falls behind there too (25 fps offline).
 
 **Re-embedding at cuts without a stall.** At a cut the instruction is embedded again with the frame after it ("Flicker",
 carry-over), and live the stream waits for it: at 640 on the 3090 Ti (fp16 engine) the cut batch comes out about
