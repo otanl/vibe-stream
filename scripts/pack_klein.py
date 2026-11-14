@@ -35,6 +35,7 @@ def main():
     ap.add_argument("--size", type=int, default=768)
     ap.add_argument("--vibe_keys", nargs="*", default=[])
     ap.add_argument("--teacher_steps", type=int, default=8, help="steps of VIBE's teacher for --vibe_keys")
+    ap.add_argument("--source", default="SA-V (CC BY 4.0)", help="where the windows' clips come from (meta.json)")
     a = ap.parse_args()
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -78,7 +79,7 @@ def main():
     (out / "meta.json").write_text(json.dumps(dict(
         size=a.size, prompts={k: ALL_PROMPTS[k] for k in keys}, teacher="FLUX.2-klein-4B, 4 steps, seed 42, per frame",
         klein_prompts=info["klein_prompts"], vibe_keys=a.vibe_keys, teacher_steps=a.teacher_steps, nfr=nfr,
-        stride="per window (windows.json)", windows=len(list(out.glob("w*.npz"))), source="SA-V (CC BY 4.0)",
+        stride="per window (windows.json)", windows=len(list(out.glob("w*.npz"))), source=a.source,
         noise="cpu fp32 randn seed 42")), encoding="utf-8")
     print(f"[pack] done in {time.time() - t0:.0f} s; round trip PSNR median {np.median(rt) if rt else 0:.1f} dB", flush=True)
 
