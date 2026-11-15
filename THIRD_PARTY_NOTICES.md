@@ -34,6 +34,38 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
+### RIFE (display-side frame interpolation)
+
+`src/vibe_stream/rife.py` contains the flow network of RIFE v4.25 (`Head`, `ResConv`, `IFBlock`, `IFNet` and the
+warp), re-written for batched inference from `IFNet_HDv3.py` and `warplayer.py` of
+[Practical-RIFE](https://github.com/hzwer/Practical-RIFE) by Zhewei Huang et al., with parameter names kept so that
+the upstream checkpoint loads (RIFE: *Real-Time Intermediate Flow Estimation for Video Frame Interpolation*, ECCV
+2022). No RIFE weights are included; users download `flownet.pkl` from the upstream links.
+
+```
+MIT License
+
+Copyright (c) 2021 hzwer
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
 ## Dependencies (not included)
 
 | Component | Source | Licence as published |
@@ -47,6 +79,9 @@ SOFTWARE.
 | SA-V clips (training windows of the SA-V students, `sav_windows.py`) | [Meta SA-V](https://ai.meta.com/datasets/segment-anything-video/) | CC BY 4.0; downloading needs Meta's terms accepted. The clips are not redistributed here |
 | FLUX.2-klein-4B (teacher of the SA-V students, `klein_teacher.py`) | [black-forest-labs/FLUX.2-klein-4B](https://huggingface.co/black-forest-labs/FLUX.2-klein-4B) | Apache-2.0 |
 | YuNet face detector (face pass, `vibe_stream.face`) | [opencv/opencv_zoo](https://github.com/opencv/opencv_zoo/tree/main/models/face_detection_yunet) | MIT |
+| SAM 2.1 hiera-tiny (local edits, `vibe_stream.sam_tracker`) | [facebook/sam2.1-hiera-tiny](https://huggingface.co/facebook/sam2.1-hiera-tiny) | Apache-2.0 |
+| RIFE v4.25 weights (`flownet.pkl`, display side) | [hzwer/Practical-RIFE](https://github.com/hzwer/Practical-RIFE) | MIT |
+| NVIDIA RTX Video SDK (display-side upscale, `build_rtx_vsr.py`; its CUDA sample is copied and patched at build time, not included) | [developer.nvidia.com/rtx-video-sdk](https://developer.nvidia.com/rtx-video-sdk) | NVIDIA RTX SDKs licence: use, modification of the samples, and distribution in object code inside an application with material additional functionality; RTX GPUs only |
 | DAVIS-2017 clips used for training and evaluation; five appear in the README demo video | [davischallenge.org](https://davischallenge.org/davis2017/code.html) | the organizers license their annotations under CC BY 4.0 (challenge rules page) and the site's dataset metadata says CC BY-NC 4.0; no separate licence is stated for the video frames. The clips are not redistributed here |
 
 Check the publishers' current terms before redistributing weights or derived checkpoints (such as a trained student

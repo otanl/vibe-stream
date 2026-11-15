@@ -8,13 +8,16 @@ Usage:
       --engine out/trt/vibe_lam4_2step_768_b8.engine --prompt oil
   python scripts/stream_video.py ... --student runs/lam4_2step/lora.safetensors      (PyTorch, no TensorRT)
   --loop_frames 480 repeats the clip for a sustained throughput figure; --compare writes input | output.
+  --interp 2 --upscale vsr adds RIFE in-between frames and a 2x upscale on the display side, timed apart ([post]).
 """
 import argparse
 import json
+import time
 from itertools import cycle, islice
 from pathlib import Path
 from statistics import mean
 
+import cv2
 import numpy as np
 import torch
 from PIL import Image
@@ -91,6 +94,15 @@ def main():
                         "(build_trt_packed.py, vibe_stream.packed)")
     p.add_argument("--face_every", type=int, default=1,
                    help="with --packed_engine: edit the crop on every n-th frame, its last edit warped in between")
+    p.add_argument("--interp", type=int, default=1,
+                   help="display side: RIFE in-between frames, this many output frames per frame (vibe_stream.rife)")
+    p.add_argument("--rife_engine", default=None,
+                   help="with --interp: RIFE TensorRT engine (build_trt_rife.py; default out/trt/rife_<size>_b<batch>"
+                        ".engine)")
+    p.add_argument("--upscale", choices=["vsr", "bicubic"], default=None,
+                   help="display side: 2x upscale of the output, RTX Video Super Resolution (build_rtx_vsr.py) or "
+                        "bicubic (vibe_stream.upscale); after --interp")
+    p.add_argument("--upscale_quality", type=int, default=4, choices=[1, 2, 3, 4], help="with --upscale vsr")
     p.add_argument("--out_json", default=None)
     a = p.parse_args()
     prompt = PROMPTS.get(a.prompt, a.prompt)
@@ -183,13 +195,49 @@ def main():
                warp=warping_error(frames, outs), sobel=sobel(outs), sobel_input=sobel(frames),
                edge=mean(edge_agreement(x, y) for x, y in zip(frames[::4], outs[::4])))
     print(f"[quality] warp {res['warp']:.2f}  sobel {res['sobel']:.2f} (input {res['sobel_input']:.2f})  edge {res['edge']:.3f}")
+    shown, ins, factor = outs, frames, 1
+    if a.interp > 1 or a.upscale:
+        shown, post_s, timed = display_side(a, outs, size, ed.batch_size)
+        factor = max(a.interp, 1)
+        res["post_ms_per_frame"] = 1000 * post_s / max(timed, 1)
+        print(f"[post] {'RIFE x%d' % a.interp if a.interp > 1 else ''}{' + ' if a.interp > 1 and a.upscale else ''}"
+              f"{'%s x2 upscale' % a.upscale if a.upscale else ''}: {res['post_ms_per_frame']:.1f} ms per stream frame "
+              f"({timed} frames, after the first batch), {len(shown)} frames of {shown[0].shape[1]}x{shown[0].shape[0]}")
+        h, w = shown[0].shape[:2]
+        ins = [cv2.resize(f, (w, h), interpolation=cv2.INTER_CUBIC) for f in frames for _ in range(factor)]
     if a.output:
-        vid = [np.concatenate([f, o], axis=1) for f, o in zip(frames, outs)] if a.compare else outs
-        write_video(a.output, vid, video_fps(a.input))
+        vid = [np.concatenate([f, o], axis=1) for f, o in zip(ins, shown)] if a.compare else shown
+        write_video(a.output, vid, video_fps(a.input) * factor)
         print(f"[out] {a.output}")
     if a.out_json:
         Path(a.out_json).parent.mkdir(parents=True, exist_ok=True)
         Path(a.out_json).write_text(json.dumps(res, indent=1), encoding="utf-8")
+
+
+def display_side(a, outs, size, batch):
+    """RIFE in-between frames and / or a 2x upscale of the stream's output frames, batch by batch on the GPU.
+    Returns the frames to show, the seconds spent after the first batch and the stream frames that covers."""
+    from vibe_stream.rife import RIFEInterpolator
+    from vibe_stream.upscale import Upscaler
+    rife = None
+    if a.interp > 1:
+        rife = RIFEInterpolator(engine=a.rife_engine or str(ROOT / f"out/trt/rife_{size}_b{batch}.engine"))
+    up = Upscaler(a.upscale, quality=a.upscale_quality) if a.upscale else None
+    shown, secs, timed = [], 0.0, 0
+    for b0 in range(0, len(outs), batch):
+        x = torch.from_numpy(np.stack(outs[b0:b0 + batch])).cuda()
+        torch.cuda.synchronize()
+        t = time.perf_counter()
+        if rife is not None:
+            x = rife.expand_gpu(x, a.interp)
+        if up is not None:
+            x = up(x)
+        torch.cuda.synchronize()
+        if b0:
+            secs += time.perf_counter() - t
+            timed += min(batch, len(outs) - b0)
+        shown.extend(x.cpu().numpy())
+    return shown, secs, timed
 
 
 if __name__ == "__main__":

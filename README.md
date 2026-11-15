@@ -869,6 +869,37 @@ with `resize_student.py`, INT8 engines), 48 frames at 768, RTX 3090 Ti, ms per f
 - The DAVIS-trained `multi_carry_s05_lut_2step_768`, copied to the same sizes, edits these the same way; the
   commercial student's crop engines are faster with blocks 14 and 18 removed.
 
+### Display side: in-between frames and 2x pixels
+
+Two steps after the stream, on its output (`stream_video.py --interp 2 --upscale vsr`):
+
+- **In-between frames** (`rife.py`): RIFE v4.25 (MIT) as a TensorRT engine, one call per batch for all its
+  in-betweens, the batch's last frame carried so the pair across batches is interpolated too. 1.7 ms per in-between
+  frame at 640 (13.3 ms per batch of 8, RTX 3090 Ti). Rebuilding every other frame of the student's output from its
+  neighbours, the RIFE frames are as sharp as the real ones (Sobel 12.17 against 12.15) and show none of a
+  cross-fade's double images on dance-twirl and parkour; a cross-fade drops to 9.55. Each in-between needs the next
+  output frame, so the display runs one frame behind (33 ms at 30 fps).
+- **2x pixels** (`upscale.py`): NVIDIA RTX Video Super Resolution through the RTX Video SDK's CUDA path, called from
+  PyTorch through a small DLL that `build_rtx_vsr.py` makes from the SDK's sample (the SDK is not included; RTX GPUs
+  only). On the commercial student's output (tuk-tuk, dance-twirl, blackswan and parkour in oil, anime and
+  watercolor, 640 → 1280), against a bicubic upscale:
+
+  | Upscale, 640 → 1280 | ms per frame | Sobel | Flicker |
+  |---|---:|---:|---:|
+  | bicubic | 0.98 | 1.00 | 1.00 |
+  | bicubic + contrast-adaptive sharpening | 3.02 | 1.30 | 1.10 |
+  | Lanczos 3 + robust contrast-adaptive sharpening (FSR 1's second pass) | 2.48 | 1.59 | 1.18 |
+  | Real-ESRGAN animevideov3 (x4, then halved) | 14.99 | 1.22 | 1.05 |
+  | RTX Video Super Resolution, quality 1 | 0.58 | 1.27 | 1.04 |
+  | RTX Video Super Resolution, quality 4 | 1.26 | 1.48 | 1.09 |
+
+  Quality 4 keeps edges and brush texture crisp without ringing; Lanczos + sharpening is as sharp but rings, and
+  Real-ESRGAN flattens oil and watercolor texture. Every sharpening raises the flicker about in proportion to the
+  detail it adds: it amplifies the flicker the stream already has.
+- Together, after the 640 stream (dance-twirl, anime, carry-over + filter, 76.7 fps loop): 4.5 ms per stream frame
+  for the in-between and both frames' upscale, giving 1280 × 1280 at twice the frame rate. Interpolate first, at
+  640, then upscale.
+
 ## Setup
 
 The code expects an upstream VIBE checkout next to it (or `VIBE_REPO` pointing at one) and the weights in `models/`:
@@ -892,6 +923,12 @@ The face pass needs OpenCV's YuNet face detector (MIT) in `models/`:
 curl -L -o models/face_detection_yunet_2023mar.onnx \
     https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx
 ```
+
+The display side's in-between frames need RIFE v4.25's `flownet.pkl` (MIT) from the links in
+[Practical-RIFE](https://github.com/hzwer/Practical-RIFE), in `models/rife/`; its upscale needs the
+[RTX Video SDK](https://developer.nvidia.com/rtx-video-sdk), Visual Studio 2022, CMake and the CUDA toolkit to build
+the DLL (`build_rtx_vsr.py`), and an RTX GPU with driver R570 or later to run it. Local edits fetch SAM 2.1
+hiera-tiny (Apache-2.0) from the Hugging Face hub on first use.
 
 ## Usage
 
@@ -1052,6 +1089,12 @@ done
 python scripts/local_edit.py --input assets/davis_mp4/parkour.mp4 --instruction "remove the man" \
     --engine_384 out/trt/vibe_klein_384_b8_int8.engine --engine_512 out/trt/vibe_klein_512_b8_int8.engine \
     --output out/local/parkour_remove.mp4 --compare
+# Display side: RIFE in-betweens (weights in models/rife/, Setup) and RTX Video Super Resolution (RTX Video SDK)
+python scripts/build_trt_rife.py --size 640 --batch_size 8                 # -> out/trt/rife_640_b8.engine
+python scripts/build_rtx_vsr.py --sdk C:/path/to/RTX_Video_SDK_v1.1.0       # -> out/rtx_vsr/rtxvsr.dll
+python scripts/stream_video.py --input ... --engine out/trt/vibe_klein640_prune14_18_b8_int8.engine \
+    --tae_engine out/trt/taesana_640_b8 --carry --temporal_filter 0.7 0.3 --fast_post \
+    --interp 2 --upscale vsr --output out/stream/clip_1280_2x.mp4
 ```
 
 A student is tied to its resolution and its init noise (stored in the file). Other instructions than the ones it was
@@ -1083,6 +1126,8 @@ a mismatch is refused.
   - `local.py`: local edits (crop window, edit, paste, face check), with `local_plan.py` (the instruction's plan and
     boxes from VIBE's Qwen3-VL), `sam_tracker.py` (SAM 2.1 as a streaming tracker in CUDA graphs) and `bgfill.py`
     (background canvas for removals)
+  - `rife.py`, `upscale.py`: display side, RIFE in-between frames and the 2x upscale (RTX Video Super Resolution
+    through `out/rtx_vsr/rtxvsr.dll`, or bicubic)
   - `metrics.py`: video I/O, warping error, flicker split, Sobel, edge agreement, LPIPS, CLIP scores
 - `scripts/`: one entry point per step above.
 
