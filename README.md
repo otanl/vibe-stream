@@ -817,6 +817,58 @@ pass's cost, though:
 - RTX 3090 Ti: the offline loop stays at 33-35 fps either way, and live at batch 1 both versions sit at the edge of
   30 fps (45-117 ms over repeated runs). There detection and the crop's other work set the pace.
 
+### Local edits
+
+"Remove the man", "put sunglasses on the girl on the left", "make the dancer's dress red": run on the whole frame,
+such an instruction redraws everything, puts the glasses on whoever the model picks and changes the background with
+them. `vibe_stream.local` edits a crop that follows the object instead and keeps the rest of the frame as it was. The
+control stays text only:
+
+- **Plan** (`local_plan.py`, once per instruction): VIBE's own Qwen3-VL-2B reads the instruction and answers which
+  object it is about (with the words that say which one), which part of it an added thing goes on (the head for
+  sunglasses), and whether it is a removal, an addition or a change. A second question asks whether the edit sits on
+  the face itself. The same model then finds the object on the first frame, the part inside it and, for a removal,
+  the object's shadow.
+- **Track** (`sam_tracker.py`): SAM 2.1 hiera-tiny (Apache-2.0) follows each box frame by frame, causally, at 512 px
+  instead of its native 1024, with its state in fixed GPU buffers and one CUDA graph per frame: 9.6 ms per frame,
+  against about 45 ms through transformers' own streaming path, with matching masks (IoU 0.97-0.999).
+- **Edit**: a square window around the mask, its centre and size smoothed over time, resized for a student at the
+  crop size: 384 for parts (a face is small anyway), 512 for whole objects. Always 2 steps: the carry-over starts each
+  frame from the previous output, which brings a removed object back as a ghost and fades a new colour back.
+- **Paste**: through the dilated, feathered mask; for a removal also through what the edit changed next to the
+  object, which takes its shadow along. A removal is filled from a background canvas of real pixels seen on earlier
+  frames, carried by the ground's homography (`bgfill.py`), where VIBE's own fill would move with the object as a
+  patch. An edit on the face is pasted only while a face turned to the camera is seen in the part's window (YuNet's
+  landmarks), so the back of a head does not get a black bar, and it fades in and out.
+
+On six DAVIS-2017 clips (evaluation only) with the commercial student (`klein640_prune14_18`, copied to 384 and 512
+with `resize_student.py`, INT8 engines), 48 frames at 768, RTX 3090 Ti, ms per frame over frames 16-47:
+
+| Instruction (clip) | Crop | Track | Student | Paste | fps |
+|---|---:|---:|---:|---:|---:|
+| remove the man (parkour) | 512 | 9.6 | 13.1 | 4.3 | 35.2 |
+| remove the dog (dog) | 512 | 9.7 | 13.3 | 4.3 | 34.9 |
+| make the dancer's dress red (dance-twirl) | 512 | 9.8 | 13.3 | 2.2 | 38.1 |
+| put a red cap on the man (parkour) | 384 | 9.7 | 8.5 | 1.2 | 49.5 |
+| put sunglasses on the girl on the left (schoolgirls) | 384 | 9.6 | 8.6 | 3.2 | 44.6 |
+| put sunglasses on the tennis player (tennis) | 384 | 9.6 | 8.5 | 3.7 | 43.7 |
+
+(For the sunglasses, Paste includes 2-2.5 ms waiting for the face check, which runs on a host thread.)
+
+- The parkour man goes with his shadow on the wall. The dog goes too, but the ground where it was stays a faint
+  patch: most of that region was never seen without the dog, so the canvas has VIBE's fill there, toned to match.
+- The glasses land on the right person only and leave when the schoolgirl turns away. Their shape still changes from
+  frame to frame and they look pasted on; a 2-step edit of each frame redraws them.
+- The dress turns red top and skirt; the cap stays on through the jumps.
+- The one-off start is 7.5-8.5 s: 2.8-3.3 s for the plan, 4.7-5.1 s for finding the objects, 0.2 s for the crop's
+  embedding. Qwen3-VL's generation takes about 70 ms per token here (host-bound); a static cache with a compiled
+  decoding step brings it to 35-60 ms, after a compilation of about a minute.
+- One object per instruction (the first one found). SAM 2 does real work: a box carried by optical flow instead
+  (median motion of a point grid, DIS at 128-384 px, with or without a forward-backward check) lost the object
+  within a second on 7 of 9 clips.
+- The DAVIS-trained `multi_carry_s05_lut_2step_768`, copied to the same sizes, edits these the same way; the
+  commercial student's crop engines are faster with blocks 14 and 18 removed.
+
 ## Setup
 
 The code expects an upstream VIBE checkout next to it (or `VIBE_REPO` pointing at one) and the weights in `models/`:
@@ -988,6 +1040,18 @@ python scripts/build_trt_packed.py --student runs/klein640_prune14_18/lora.safet
     --engine out/trt/vibe_klein640_prune14_18_packed256_int8.engine --int8
 python scripts/measure_latency.py ... --face_engine main --face_tae_engine out/trt/taesana_256_b1 \
     --face_model out/trt/yunet_640.engine --packed_engine out/trt/vibe_klein640_prune14_18_packed256_int8.engine
+# Local edits (vibe_stream.local): the student copied to the crop sizes and built there, taesana at those sizes,
+# YuNet (Setup); SAM 2.1 hiera-tiny comes from the Hugging Face hub on first use
+for s in 384 512; do
+  python scripts/resize_student.py runs/klein640_prune14_18/lora.safetensors \
+      runs/klein640_prune14_18/lora_$s.safetensors --size $s
+  python scripts/build_trt.py --student runs/klein640_prune14_18/lora_$s.safetensors \
+      --engine out/trt/vibe_klein_${s}_b8_int8.engine --int8 --remove_blocks 14,18
+  python scripts/build_trt_tae.py --size $s --batch 8 --prefix out/trt/taesana_${s}_b8
+done
+python scripts/local_edit.py --input assets/davis_mp4/parkour.mp4 --instruction "remove the man" \
+    --engine_384 out/trt/vibe_klein_384_b8_int8.engine --engine_512 out/trt/vibe_klein_512_b8_int8.engine \
+    --output out/local/parkour_remove.mp4 --compare
 ```
 
 A student is tied to its resolution and its init noise (stored in the file). Other instructions than the ones it was
@@ -1016,6 +1080,9 @@ a mismatch is refused.
   - `packed.py`: the face crop riding along in the frame's transformer call (packed graph, engine, editor)
   - `presets.py`: instructions (also Klein's wordings and the broad self-distilled set) and clip sets
   - `state_attn.py`: self-attention state carried from frame to frame (experimental, Negative results)
+  - `local.py`: local edits (crop window, edit, paste, face check), with `local_plan.py` (the instruction's plan and
+    boxes from VIBE's Qwen3-VL), `sam_tracker.py` (SAM 2.1 as a streaming tracker in CUDA graphs) and `bgfill.py`
+    (background canvas for removals)
   - `metrics.py`: video I/O, warping error, flicker split, Sobel, edge agreement, LPIPS, CLIP scores
 - `scripts/`: one entry point per step above.
 

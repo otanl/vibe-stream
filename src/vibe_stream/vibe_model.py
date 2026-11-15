@@ -327,6 +327,31 @@ class VibeModel:
         out = proc.batch_decode(ids[:, x["input_ids"].shape[1]:], skip_special_tokens=True)[0]
         return " ".join(out.split())
 
+    @torch.inference_mode()
+    def chat(self, text: str, image: np.ndarray | Image.Image | None = None, max_new_tokens: int = 160) -> str:
+        """VIBE's own Qwen3-VL answering `text` (about `image`, if given), greedy: the planning and grounding of local
+        edits (`vibe_stream.local_plan`). The image goes in at the processor's default resolution, as Qwen3-VL's
+        grounding expects. Like `style_prompt`, brings the text encoder back to the GPU for the call if it was
+        offloaded."""
+        if self.te_resident:
+            raise RuntimeError("chat needs the unquantized text encoder (its lm_head is dropped when quantized)")
+        img = image if image is None or isinstance(image, Image.Image) else Image.fromarray(image)
+        proc, te = self.pipe.tokenizer, self.pipe.text_encoder
+        content = ([{"type": "image", "image": img}] if img is not None else []) + [{"type": "text", "text": text}]
+        prompt = proc.apply_chat_template([{"role": "user", "content": content}], tokenize=False,
+                                          add_generation_prompt=True)
+        x = proc(text=[prompt], images=[img] if img is not None else None, return_tensors="pt").data
+        offloaded = next(te.parameters()).device != self.device
+        if offloaded:
+            te.to(self.device)
+        try:
+            x = {k: v.to(self.device) for k, v in x.items()}
+            ids = te.generate(**x, max_new_tokens=max_new_tokens, do_sample=False)
+        finally:
+            if offloaded:
+                self.offload_text_encoder()
+        return proc.batch_decode(ids[:, x["input_ids"].shape[1]:], skip_special_tokens=True)[0].strip()
+
     @torch.no_grad()
     def project_embedding(self, emb: torch.Tensor) -> torch.Tensor:
         """caption_projection + caption_norm in fp32, (B, L, heads * head_dim).
