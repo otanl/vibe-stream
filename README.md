@@ -1171,6 +1171,26 @@ a mismatch is refused.
     - What the blur does change is correspondence. On sharp faces Klein keeps glasses, the turn of the head and
       the expression; on blurred ones it draws a generic face. A student trained on SA-V is taught that what is
       inside a face does not matter.
+- **Sharp faces from video-model generations.** To give the student faces SA-V does not have:
+  - Data: FastVideo/Wan2.2-Syn-121x704x1280_32k (Apache-2.0: Wan2.2-TI2V-5B generations, stored as latents and
+    decoded with Wan2.2's VAE). From the 824 clips whose captions name people in a medium or close shot, 660
+    windows with a face at least 40 px wide on 5 of 10 frames (median 147 px at 768), the square placed on the face.
+  - Targets: Klein on 2 instructions each, night from VIBE's teacher, 3 broad instructions self-distilled from the
+    full student, packed as for `klein640_prune14_18`.
+  - Training: `klein640_prune14_18` trained on for 3000 steps on SA-V's windows and these, in two mixes: about 71 %
+    of the (window, instruction) pairs from the new windows, and about 55 % (SA-V's windows listed twice).
+  - Results, base / 71 % / 55 %, carry-over + filter 0.7 / 0.3:
+    - CLIP direction 0.156 / 0.156 / 0.156, flicker 7.42 / 7.58 / 7.48, Sobel 10.09 / 10.40 / 10.28.
+    - The face region's change without the face pass 9.73 / 10.12 / 9.99, with it 5.87 / 6.27 / 6.11.
+    - Face fidelity on 12 DAVIS-2017 sequences with large faces and 2 Intel sample videos (CC BY 4.0), oil, anime
+      and watercolor, 48 frames (evaluation only). A face counts as kept when YuNet finds one in the output within a
+      third of the input face's width of its centre; for kept faces, the five landmarks' mean distance to the
+      input's over the face's width. Kept 90.7 / 90.9 / 91.3 %, distance (median) 0.058 / 0.059 / 0.058; with the
+      face pass 90.2 / 89.9 / 90.4 % and 0.055 / 0.053 / 0.055. Whole faces of about 150 px (the Intel head-pose
+      clip, its left and right squares): all kept, 0.039 / 0.039 / 0.038.
+  - Interpretation: the student already holds where a large face's eyes, nose and mouth are, to 4 % of its width.
+    What is left is flicker, and sharp faces in the data do not change it. A side-by-side video shows no visible
+    difference. On large faces the face pass moves the landmarks a little (one face in anime: 0.06 → 0.08-0.10).
 - **Holding detail where the input does not change.** Small moving detail, faces above all, flickers because each
   frame's carried step redraws it. Three ways to hold it, judged on the 640 path (carry-over + filter 0.7 / 0.3):
   - At run time, a filter that holds the high band where the output jumps while the input is explained by its motion,
